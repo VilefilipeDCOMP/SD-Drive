@@ -186,6 +186,75 @@ class MetadataService(rpc.MetadataServiceServicer):
 
         return state
 
+    def ResolveDownload(self, request, context):
+        try:
+            return self.resolve_download(request)
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))
+
+    def resolve_download(self, request: pb.ResolveDownloadRequest) -> pb.ResolveDownloadResponse:
+        path = request.path
+        self._validate_path(path)
+
+        with self._lock:
+            stored = self._files.get(path)
+            if stored is None:
+                raise AllocationError(grpc.StatusCode.NOT_FOUND, "Arquivo não encontrado")
+
+            metadata = pb.FileMetadata.FromString(stored)
+            if metadata.state != pb.FILE_COMMITTED:
+                raise AllocationError(grpc.StatusCode.NOT_FOUND, "Arquivo não encontrado")
+
+            manifest, allocation, confirmed = self._find_committed_upload(metadata)
+            chunks, replication_state = self._build_download_chunks(manifest, allocation, confirmed)
+            metadata.replication_state = replication_state
+            return pb.ResolveDownloadResponse(file=metadata, chunks=chunks)
+
+    def _find_committed_upload(self, metadata):
+        for pending in self._operations.values():
+            allocation = pb.AllocateUploadResponse.FromString(pending.response)
+            if allocation.file_id != metadata.file_id or allocation.version != metadata.version:
+                continue
+
+            confirmed = self._committed_receipts.get(allocation.upload_id)
+            if confirmed is not None:
+                manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
+                return manifest, allocation, confirmed
+
+        raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Arquivo confirmado sem manifesto correspondente")
+
+    def _build_download_chunks(self, manifest, allocation, confirmed):
+        placements = {}
+        for placement in allocation.chunks:
+            placements[placement.block_id] = placement
+
+        chunks = []
+        replication_state = pb.REPLICATION_HEALTHY
+        for chunk in sorted(manifest.chunks, key=lambda chunk: chunk.index):
+            location = pb.ChunkLocation(manifest=chunk)
+            for target in placements[chunk.block_id].targets:
+                if target.node_id not in confirmed[chunk.block_id]:
+                    continue
+
+                try:
+                    node = self._registry.get_node_capacity(target.node_id)
+                except KeyError:
+                    continue
+                if node.state not in (pb.NODE_ALIVE, pb.NODE_DRAINING):
+                    continue
+
+                address = pb.NodeAddress(node_id=node.node_id, machine_id=node.machine_id, disk_id=node.disk_id, grpc_target=node.grpc_target)
+                location.replicas.append(pb.ReplicaLocation(node=address, healthy=True))
+
+            if len(location.replicas) == 0:
+                replication_state = pb.REPLICATION_UNAVAILABLE
+            elif len(location.replicas) < allocation.replication_factor and replication_state != pb.REPLICATION_UNAVAILABLE:
+                replication_state = pb.REPLICATION_UNDER_REPLICATED
+
+            chunks.append(location)
+
+        return chunks, replication_state
+
     def _prepare_request(self, request):
         req = pb.AllocateUploadRequest()
         req.CopyFrom(request)
