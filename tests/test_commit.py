@@ -209,7 +209,7 @@ def test_lease_must_still_be_valid_at_publication(monkeypatch):
     assert exc.value.code == grpc.StatusCode.ABORTED
     assert request.path not in service._files
 
-def test_overwrite_flag_does_not_replace_confirmed_file_in_this_increment():
+def test_overwrite_keeps_previous_file_visible_until_commit():
     service, request, allocation, _ = prepare_upload()
     commit = commit_request(request, allocation)
     first = service.commit_upload(commit)
@@ -217,7 +217,8 @@ def test_overwrite_flag_does_not_replace_confirmed_file_in_this_increment():
     request.chunks[0].block_id = str(uuid4())
     request.overwrite = True
 
-    with pytest.raises(AllocationError) as exc:
-        service.allocate_upload(request)
-    assert exc.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    replacement = service.allocate_upload(request)
+    visible = service.resolve_download(pb.ResolveDownloadRequest(path=request.path))
+    assert visible.file == first
     assert service.commit_upload(commit) == first
+    assert replacement.version == 2

@@ -55,6 +55,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._block_ids: set[str] = set()
         self._files: dict[str, bytes] = {}
         self._committed_receipts = {}
+        self._upload_results = {}
 
     def AllocateUpload(self, request, context):
         try:
@@ -77,7 +78,15 @@ class MetadataService(rpc.MetadataServiceServicer):
             self._check_upload_conflicts(req)
             placements, reservations = self._allocate_chunks(req)
 
-            response = pb.AllocateUploadResponse(upload_id=str(uuid4()), file_id=str(uuid4()), version=1, replication_factor=self._n, write_quorum=self._w, chunks=placements, lease_expires_at_unix_ms=now_ms + self._lease_seconds * 1000)
+            current = self._files.get(req.path)
+            version = 1
+            file_id = str(uuid4())
+            if current is not None:
+                previous = pb.FileMetadata.FromString(current)
+                version = previous.version + 1
+                file_id = previous.file_id
+
+            response = pb.AllocateUploadResponse(upload_id=str(uuid4()), file_id=file_id, version=version, replication_factor=self._n, write_quorum=self._w, chunks=placements, lease_expires_at_unix_ms=now_ms + self._lease_seconds * 1000)
 
             self._register_upload(req, fingerprint, response, reservations)
             return response
@@ -107,19 +116,30 @@ class MetadataService(rpc.MetadataServiceServicer):
             if previous is not None:
                 if confirmed != previous:
                     raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Upload já confirmado com recibos diferentes")
-                return pb.FileMetadata.FromString(self._files[pending.path])
+                return pb.FileMetadata.FromString(self._upload_results[req.upload_id])
 
-            if self._paths.get(pending.path) is not pending or pending.path in self._files:
+            if self._paths.get(pending.path) is not pending:
                 raise AllocationError(grpc.StatusCode.ABORTED, "Upload não possui mais a reserva do caminho")
+
+            current = self._files.get(pending.path)
+            current_version = 0
+            created_at = now_ms
+            if current is not None:
+                previous_metadata = pb.FileMetadata.FromString(current)
+                current_version = previous_metadata.version
+                created_at = previous_metadata.created_at_unix_ms
+            if current_version != allocation.version - 1:
+                raise AllocationError(grpc.StatusCode.ABORTED, "Versão alterada durante o upload")
 
             replication_state = self._commit_replication_state(confirmed, allocation.replication_factor)
             now_ms = int(self._clock() * 1000)
             if pending.expires_at_ms <= now_ms:
                 raise AllocationError(grpc.StatusCode.ABORTED, "Lease expirado")
 
-            metadata = pb.FileMetadata(file_id=allocation.file_id, path=manifest.path, version=allocation.version, plaintext_size_bytes=manifest.plaintext_size_bytes, plaintext_sha256=manifest.plaintext_sha256, encryption=manifest.encryption, state=pb.FILE_COMMITTED, replication_state=replication_state, desired_replica_count=allocation.replication_factor, created_at_unix_ms=now_ms, updated_at_unix_ms=now_ms)
+            metadata = pb.FileMetadata(file_id=allocation.file_id, path=manifest.path, version=allocation.version, plaintext_size_bytes=manifest.plaintext_size_bytes, plaintext_sha256=manifest.plaintext_sha256, encryption=manifest.encryption, state=pb.FILE_COMMITTED, replication_state=replication_state, desired_replica_count=allocation.replication_factor, created_at_unix_ms=created_at, updated_at_unix_ms=now_ms)
 
             self._files[pending.path] = metadata.SerializeToString()
+            self._upload_results[req.upload_id] = metadata.SerializeToString()
             self._committed_receipts[req.upload_id] = confirmed
             del self._paths[pending.path]
             # A capacidade continua contabilizada; o lease não deve liberar blocos confirmados.
@@ -285,13 +305,15 @@ class MetadataService(rpc.MetadataServiceServicer):
         if req.path in self._paths:
             raise AllocationError(grpc.StatusCode.ABORTED, "Caminho com upload em andamento")
 
+        current_version = 0
         if req.path in self._files:
-            if req.overwrite:
-                raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Sobrescrita de arquivo confirmado ainda não implementada")
-            raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Arquivo já existe")
+            current = pb.FileMetadata.FromString(self._files[req.path])
+            current_version = current.version
+            if current.state == pb.FILE_COMMITTED and not req.overwrite:
+                raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Arquivo já existe")
 
-        if req.HasField("expected_version") and req.expected_version != 0:
-            raise AllocationError(grpc.StatusCode.ABORTED, "Não existe versão confirmada")
+        if req.HasField("expected_version") and req.expected_version != current_version:
+            raise AllocationError(grpc.StatusCode.ABORTED, "Versão esperada não corresponde à versão atual")
 
         for chunk in req.chunks:
             if chunk.block_id in self._block_ids:
