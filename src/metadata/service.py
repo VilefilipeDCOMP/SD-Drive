@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from itertools import combinations
 from pathlib import PurePosixPath
@@ -26,7 +26,7 @@ class PendingUpload:
     path: str
 
 class MetadataService(rpc.MetadataServiceServicer):
-    def __init__(self, registry: NodeRegistryPort, *, replication_factor: int = 3, write_quorum: int | str = "all", max_usage_fraction: float = 0.90, lease_seconds: int = 900, clock: Callable[[], float] = time.time):
+    def __init__(self, registry: NodeRegistryPort, *, replication_factor: int = 3, write_quorum: int | str = "all", max_usage_fraction: float = 0.90, lease_seconds: int = 900, clock: Callable[[], float] = time.time, max_lifetime_seconds: int = 14400):
         if type(replication_factor) is not int or replication_factor < 1:
             raise ValueError("Fator de replicação deve ser inteiro positivo")
 
@@ -38,7 +38,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         if type(quorum) is not int or not 1 <= quorum <= replication_factor:
             raise ValueError("Quórum de escrita deve ser 'all' ou inteiro entre 1 e N")
 
-        if not 0 < max_usage_fraction <= 1 or lease_seconds <= 0:
+        if not 0 < max_usage_fraction <= 1 or lease_seconds <= 0 or max_lifetime_seconds <= 0:
             raise ValueError("Ocupação e duração do lease inválidas")
 
         self._registry = registry
@@ -47,6 +47,8 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._max_usage = Decimal(str(max_usage_fraction))
         self._lease_seconds = lease_seconds
         self._clock = clock
+        self._max_lifetime_seconds = max_lifetime_seconds
+        self._upload_started = {}
 
         self._lock = RLock()
         self._operations: dict[str, PendingUpload] = {}
@@ -88,7 +90,7 @@ class MetadataService(rpc.MetadataServiceServicer):
                 version = previous.version + 1
                 file_id = previous.file_id
 
-            response = pb.AllocateUploadResponse(upload_id=str(uuid4()), file_id=file_id, version=version, replication_factor=self._n, write_quorum=self._w, chunks=placements, lease_expires_at_unix_ms=now_ms + self._lease_seconds * 1000)
+            response = pb.AllocateUploadResponse(upload_id=str(uuid4()), file_id=file_id, version=version, replication_factor=self._n, write_quorum=self._w, chunks=placements, lease_expires_at_unix_ms=now_ms + min(self._lease_seconds, self._max_lifetime_seconds) * 1000)
 
             self._register_upload(req, fingerprint, response, reservations)
             return response
@@ -409,6 +411,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._reserved = reservations
         self._upload_reservations[req.operation_id] = upload_reservations
         self._operations[req.operation_id] = pending
+        self._upload_started[req.operation_id] = int(self._clock() * 1000)
         self._paths[req.path] = pending
 
         for chunk in req.chunks:
@@ -528,5 +531,24 @@ class MetadataService(rpc.MetadataServiceServicer):
                 if self._paths.get(pending.path) is pending:
                     del self._paths[pending.path]
                 return Empty()
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))
+
+    def RenewLease(self, request, context):
+        try:
+            with self._lock:
+                pending, allocation = self._find_upload(request.upload_id)
+                now_ms = int(self._clock() * 1000)
+                if request.upload_id in self._aborted or request.upload_id in self._committed_receipts:
+                    raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Upload encerrado")
+                if pending.expires_at_ms <= now_ms:
+                    raise AllocationError(grpc.StatusCode.ABORTED, "Lease expirado")
+                manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
+                maximum = self._upload_started[manifest.operation_id] + self._max_lifetime_seconds * 1000
+                allocation.lease_expires_at_unix_ms = min(now_ms + self._lease_seconds * 1000, maximum)
+                updated = replace(pending, expires_at_ms=allocation.lease_expires_at_unix_ms, response=allocation.SerializeToString())
+                self._operations[manifest.operation_id] = updated
+                self._paths[pending.path] = updated
+                return pb.RenewLeaseResponse(lease_expires_at_unix_ms=updated.expires_at_ms)
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
