@@ -8,6 +8,7 @@ from typing import Callable
 from uuid import UUID, uuid4
 
 import grpc
+from google.protobuf.empty_pb2 import Empty
 import dcomp_drive_pb2 as pb
 import dcomp_drive_pb2_grpc as rpc
 from common.ports import NodeRegistryPort
@@ -56,6 +57,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._files: dict[str, bytes] = {}
         self._committed_receipts = {}
         self._upload_results = {}
+        self._aborted = set()
 
     def AllocateUpload(self, request, context):
         try:
@@ -108,6 +110,9 @@ class MetadataService(rpc.MetadataServiceServicer):
 
             if req.upload_id not in self._committed_receipts and pending.expires_at_ms <= now_ms:
                 raise AllocationError(grpc.StatusCode.ABORTED, "Lease expirado")
+
+            if req.upload_id in self._aborted:
+                raise AllocationError(grpc.StatusCode.ABORTED, "Upload cancelado")
 
             manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
             confirmed = self._validate_receipts(manifest, allocation, req.receipts)
@@ -295,6 +300,10 @@ class MetadataService(rpc.MetadataServiceServicer):
 
         if previous.fingerprint != fingerprint:
             raise AllocationError(grpc.StatusCode.INVALID_ARGUMENT, 'operation_id reutilizado com pedido diferente')
+
+        allocation = pb.AllocateUploadResponse.FromString(previous.response)
+        if allocation.upload_id in self._aborted:
+            raise AllocationError(grpc.StatusCode.ABORTED, "Upload cancelado")
 
         if previous.expires_at_ms <= now_ms:
             raise AllocationError(grpc.StatusCode.ABORTED, "Lease expirado")
@@ -502,3 +511,22 @@ class MetadataService(rpc.MetadataServiceServicer):
     @staticmethod
     def _invalid_argument(message):
         raise AllocationError(grpc.StatusCode.INVALID_ARGUMENT, message)
+
+    def AbortUpload(self, request, context):
+        try:
+            with self._lock:
+                pending, allocation = self._find_upload(request.upload_id)
+                if request.upload_id in self._committed_receipts:
+                    raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Upload já confirmado")
+                self._aborted.add(request.upload_id)
+                manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
+                reservations = self._upload_reservations.pop(manifest.operation_id, {})
+                for node_id, size in reservations.items():
+                    self._reserved[node_id] -= size
+                    if self._reserved[node_id] == 0:
+                        del self._reserved[node_id]
+                if self._paths.get(pending.path) is pending:
+                    del self._paths[pending.path]
+                return Empty()
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))
