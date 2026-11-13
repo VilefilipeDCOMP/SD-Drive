@@ -1,4 +1,6 @@
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, asdict
+from contextlib import contextmanager
+from metadata.store import MetadataStore
 from decimal import Decimal
 from itertools import combinations
 from pathlib import PurePosixPath
@@ -26,7 +28,7 @@ class PendingUpload:
     path: str
 
 class MetadataService(rpc.MetadataServiceServicer):
-    def __init__(self, registry: NodeRegistryPort, *, replication_factor: int = 3, write_quorum: int | str = "all", max_usage_fraction: float = 0.90, lease_seconds: int = 900, clock: Callable[[], float] = time.time, max_lifetime_seconds: int = 14400):
+    def __init__(self, registry: NodeRegistryPort, *, replication_factor: int = 3, write_quorum: int | str = "all", max_usage_fraction: float = 0.90, lease_seconds: int = 900, clock: Callable[[], float] = time.time, max_lifetime_seconds: int = 14400, db_path: str | None = None):
         if type(replication_factor) is not int or replication_factor < 1:
             raise ValueError("Fator de replicação deve ser inteiro positivo")
 
@@ -60,6 +62,12 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._committed_receipts = {}
         self._upload_results = {}
         self._aborted = set()
+        self._store = MetadataStore(db_path) if db_path is not None else None
+        self._transaction_depth = 0
+        if self._store is not None:
+            stored = self._store.load()
+            if stored is not None:
+                self._restore(stored)
 
     def AllocateUpload(self, request, context):
         try:
@@ -71,7 +79,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         req = self._prepare_request(request)
         fingerprint = req.SerializeToString(deterministic=True)
 
-        with self._lock:
+        with self._transaction():
             now_ms = int(self._clock() * 1000)
             self._release_expired_uploads(now_ms)
 
@@ -105,7 +113,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         req = pb.CommitUploadRequest()
         req.CopyFrom(request)
 
-        with self._lock:
+        with self._transaction():
             now_ms = int(self._clock() * 1000)
             self._release_expired_uploads(now_ms)
             pending, allocation = self._find_upload(req.upload_id)
@@ -223,7 +231,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         path = request.path
         self._validate_path(path)
 
-        with self._lock:
+        with self._transaction():
             stored = self._files.get(path)
             if stored is None:
                 raise AllocationError(grpc.StatusCode.NOT_FOUND, "Arquivo não encontrado")
@@ -517,7 +525,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def AbortUpload(self, request, context):
         try:
-            with self._lock:
+            with self._transaction():
                 pending, allocation = self._find_upload(request.upload_id)
                 if request.upload_id in self._committed_receipts:
                     raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Upload já confirmado")
@@ -536,7 +544,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def RenewLease(self, request, context):
         try:
-            with self._lock:
+            with self._transaction():
                 pending, allocation = self._find_upload(request.upload_id)
                 now_ms = int(self._clock() * 1000)
                 if request.upload_id in self._aborted or request.upload_id in self._committed_receipts:
@@ -552,3 +560,56 @@ class MetadataService(rpc.MetadataServiceServicer):
                 return pb.RenewLeaseResponse(lease_expires_at_unix_ms=updated.expires_at_ms)
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
+
+    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started")
+
+    def _snapshot(self):
+        state = {}
+        for name in self._state_fields:
+            state[name] = getattr(self, name)
+        state["operations"] = {}
+        state["paths"] = {}
+        for operation_id, pending in self._operations.items():
+            state["operations"][operation_id] = asdict(pending)
+            if self._paths.get(pending.path) is pending:
+                state["paths"][pending.path] = operation_id
+        return state
+
+    def _restore(self, state):
+        for name in self._state_fields:
+            setattr(self, name, state[name])
+        self._operations = {}
+        for operation_id, fields in state["operations"].items():
+            self._operations[operation_id] = PendingUpload(**fields)
+        self._paths = {}
+        for path, operation_id in state["paths"].items():
+            self._paths[path] = self._operations[operation_id]
+
+    @contextmanager
+    def _transaction(self):
+        with self._lock:
+            if self._store is None or self._transaction_depth:
+                yield
+                return
+            connection = self._store.connection
+            connection.execute("BEGIN IMMEDIATE")
+            self._transaction_depth = 1
+            original = self._store.load()
+            if original is not None:
+                self._restore(original)
+            try:
+                yield
+                self._store.save(self._snapshot())
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                if original is not None:
+                    self._restore(original)
+                raise
+            finally:
+                self._transaction_depth = 0
+
+    def close(self):
+        with self._lock:
+            if self._store is not None:
+                self._store.close()
