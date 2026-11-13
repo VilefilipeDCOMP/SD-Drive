@@ -62,6 +62,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._committed_receipts = {}
         self._upload_results = {}
         self._aborted = set()
+        self._directories = {"/"}
         self._store = MetadataStore(db_path) if db_path is not None else None
         self._transaction_depth = 0
         if self._store is not None:
@@ -76,10 +77,9 @@ class MetadataService(rpc.MetadataServiceServicer):
             context.abort(exc.code, str(exc))
 
     def allocate_upload(self, request: pb.AllocateUploadRequest) -> pb.AllocateUploadResponse:
-        req = self._prepare_request(request)
-        fingerprint = req.SerializeToString(deterministic=True)
-
         with self._transaction():
+            req = self._prepare_request(request)
+            fingerprint = req.SerializeToString(deterministic=True)
             now_ms = int(self._clock() * 1000)
             self._release_expired_uploads(now_ms)
 
@@ -229,9 +229,8 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def resolve_download(self, request: pb.ResolveDownloadRequest) -> pb.ResolveDownloadResponse:
         path = request.path
-        self._validate_path(path)
-
         with self._transaction():
+            self._validate_path(path)
             stored = self._files.get(path)
             if stored is None:
                 raise AllocationError(grpc.StatusCode.NOT_FOUND, "Arquivo não encontrado")
@@ -321,6 +320,9 @@ class MetadataService(rpc.MetadataServiceServicer):
         return pb.AllocateUploadResponse.FromString(previous.response)
 
     def _check_upload_conflicts(self, req):
+        if req.path in self._directories:
+            raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Caminho é um diretório")
+
         if req.path in self._paths:
             raise AllocationError(grpc.StatusCode.ABORTED, "Caminho com upload em andamento")
 
@@ -464,7 +466,7 @@ class MetadataService(rpc.MetadataServiceServicer):
             if part in (".", "..", ""):
                 self._invalid_argument("Caminho deve ser absoluto, canônico e identificar um arquivo")
 
-        if str(PurePosixPath(path).parent) != "/":
+        if str(PurePosixPath(path).parent) not in self._directories:
             raise AllocationError(grpc.StatusCode.NOT_FOUND, "Diretório pai não existe")
 
     def _validate_identifiers(self, req):
@@ -561,7 +563,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
 
-    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started")
+    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started", "_directories")
 
     def _snapshot(self):
         state = {}
@@ -577,7 +579,8 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def _restore(self, state):
         for name in self._state_fields:
-            setattr(self, name, state[name])
+            if name in state:
+                setattr(self, name, state[name])
         self._operations = {}
         for operation_id, fields in state["operations"].items():
             self._operations[operation_id] = PendingUpload(**fields)
@@ -613,3 +616,19 @@ class MetadataService(rpc.MetadataServiceServicer):
         with self._lock:
             if self._store is not None:
                 self._store.close()
+
+    def Mkdir(self, request, context):
+        try:
+            with self._transaction():
+                if request.path in self._directories:
+                    raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Diretório já existe")
+                self._validate_path(request.path)
+                if request.path in self._paths:
+                    raise AllocationError(grpc.StatusCode.ABORTED, "Caminho reservado por upload")
+                stored = self._files.get(request.path)
+                if stored is not None and pb.FileMetadata.FromString(stored).state == pb.FILE_COMMITTED:
+                    raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Arquivo já existe")
+                self._directories.add(request.path)
+                return Empty()
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))
