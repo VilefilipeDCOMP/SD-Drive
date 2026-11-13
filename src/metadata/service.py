@@ -632,3 +632,13 @@ class MetadataService(rpc.MetadataServiceServicer):
                 return Empty()
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
+
+    def Stat(self, request, context):
+        try:
+            with self._transaction():
+                if request.path in self._directories:
+                    return pb.StatResponse(is_directory=True)
+                result = self.resolve_download(pb.ResolveDownloadRequest(path=request.path))
+                return pb.StatResponse(is_directory=False, file=result.file, chunks=result.chunks)
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))

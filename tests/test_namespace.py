@@ -16,3 +16,13 @@ def test_mkdir_enables_nested_upload_and_rejects_missing_parent():
     with pytest.raises(AllocationError) as exc:
         service.Mkdir(pb.MkdirRequest(path="/ausente/filha"), Context())
     assert exc.value.code == grpc.StatusCode.NOT_FOUND
+
+def test_stat_reads_file_and_root_without_exposing_pending():
+    service, request, allocation, _ = prepare_upload()
+    assert service.Stat(pb.StatRequest(path="/"), Context()).is_directory
+    with pytest.raises(AllocationError):
+        service.Stat(pb.StatRequest(path=request.path), Context())
+    service.commit_upload(commit_request(request, allocation))
+    result = service.Stat(pb.StatRequest(path=request.path), Context())
+    assert result.file.state == pb.FILE_COMMITTED
+    assert len(result.chunks) == 1
