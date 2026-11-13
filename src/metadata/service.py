@@ -53,6 +53,8 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._reserved: dict[str, int] = {}
         self._upload_reservations: dict[str, dict[str, int]] = {}
         self._block_ids: set[str] = set()
+        self._files: dict[str, bytes] = {}
+        self._committed_receipts = {}
 
     def AllocateUpload(self, request, context):
         try:
@@ -79,6 +81,110 @@ class MetadataService(rpc.MetadataServiceServicer):
 
             self._register_upload(req, fingerprint, response, reservations)
             return response
+
+    def CommitUpload(self, request, context):
+        try:
+            return self.commit_upload(request)
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))
+
+    def commit_upload(self, request: pb.CommitUploadRequest) -> pb.FileMetadata:
+        req = pb.CommitUploadRequest()
+        req.CopyFrom(request)
+
+        with self._lock:
+            now_ms = int(self._clock() * 1000)
+            self._release_expired_uploads(now_ms)
+            pending, allocation = self._find_upload(req.upload_id)
+
+            if req.upload_id not in self._committed_receipts and pending.expires_at_ms <= now_ms:
+                raise AllocationError(grpc.StatusCode.ABORTED, "Lease expirado")
+
+            manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
+            confirmed = self._validate_receipts(manifest, allocation, req.receipts)
+            previous = self._committed_receipts.get(req.upload_id)
+
+            if previous is not None:
+                if confirmed != previous:
+                    raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Upload já confirmado com recibos diferentes")
+                return pb.FileMetadata.FromString(self._files[pending.path])
+
+            if self._paths.get(pending.path) is not pending or pending.path in self._files:
+                raise AllocationError(grpc.StatusCode.ABORTED, "Upload não possui mais a reserva do caminho")
+
+            replication_state = self._commit_replication_state(confirmed, allocation.replication_factor)
+            now_ms = int(self._clock() * 1000)
+            if pending.expires_at_ms <= now_ms:
+                raise AllocationError(grpc.StatusCode.ABORTED, "Lease expirado")
+
+            metadata = pb.FileMetadata(file_id=allocation.file_id, path=manifest.path, version=allocation.version, plaintext_size_bytes=manifest.plaintext_size_bytes, plaintext_sha256=manifest.plaintext_sha256, encryption=manifest.encryption, state=pb.FILE_COMMITTED, replication_state=replication_state, desired_replica_count=allocation.replication_factor, created_at_unix_ms=now_ms, updated_at_unix_ms=now_ms)
+
+            self._files[pending.path] = metadata.SerializeToString()
+            self._committed_receipts[req.upload_id] = confirmed
+            del self._paths[pending.path]
+            # A capacidade continua contabilizada; o lease não deve liberar blocos confirmados.
+            del self._upload_reservations[manifest.operation_id]
+            return metadata
+
+    def _find_upload(self, upload_id):
+        for pending in self._operations.values():
+            allocation = pb.AllocateUploadResponse.FromString(pending.response)
+            if allocation.upload_id == upload_id:
+                return pending, allocation
+
+        raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Upload não encontrado")
+
+    def _validate_receipts(self, manifest, allocation, receipts):
+        chunks = {}
+        targets = {}
+        confirmed = {}
+
+        for chunk in manifest.chunks:
+            chunks[chunk.block_id] = chunk
+            confirmed[chunk.block_id] = {}
+
+        for placement in allocation.chunks:
+            targets[placement.block_id] = set()
+            for node in placement.targets:
+                targets[placement.block_id].add(node.node_id)
+
+        for receipt in receipts:
+            chunk = chunks.get(receipt.block_id)
+            if chunk is None:
+                raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Recibo de bloco não pertencente ao upload")
+            if receipt.node_id not in targets[receipt.block_id]:
+                raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Recibo de nó não previsto na alocação")
+            if receipt.stored_size_bytes != chunk.stored_size_bytes:
+                raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Tamanho do recibo difere do manifesto")
+            if receipt.verified_storage_sha256 != chunk.storage_sha256:
+                raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "SHA-256 do recibo difere do manifesto")
+
+            confirmed[receipt.block_id][receipt.node_id] = receipt.SerializeToString()
+
+        for replicas in confirmed.values():
+            if len(replicas) < allocation.write_quorum:
+                raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Quórum de escrita insuficiente em um dos chunks")
+
+        return confirmed
+
+    def _commit_replication_state(self, confirmed, replica_count):
+        state = pb.REPLICATION_HEALTHY
+        for replicas in confirmed.values():
+            accessible = 0
+            for node_id in replicas:
+                try:
+                    node_state = self._registry.get_node_state(node_id)
+                except KeyError:
+                    continue
+                if node_state in (pb.NODE_ALIVE, pb.NODE_DRAINING):
+                    accessible += 1
+
+            if accessible == 0:
+                return pb.REPLICATION_UNAVAILABLE
+            if accessible < replica_count:
+                state = pb.REPLICATION_UNDER_REPLICATED
+
+        return state
 
     def _prepare_request(self, request):
         req = pb.AllocateUploadRequest()
@@ -109,6 +215,11 @@ class MetadataService(rpc.MetadataServiceServicer):
     def _check_upload_conflicts(self, req):
         if req.path in self._paths:
             raise AllocationError(grpc.StatusCode.ABORTED, "Caminho com upload em andamento")
+
+        if req.path in self._files:
+            if req.overwrite:
+                raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Sobrescrita de arquivo confirmado ainda não implementada")
+            raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Arquivo já existe")
 
         if req.HasField("expected_version") and req.expected_version != 0:
             raise AllocationError(grpc.StatusCode.ABORTED, "Não existe versão confirmada")
