@@ -48,3 +48,14 @@ def test_rename_moves_directory_tree_without_changing_blocks():
     assert result.chunks[0].manifest.block_id == request.chunks[0].block_id
     with pytest.raises(AllocationError):
         service.resolve_download(pb.ResolveDownloadRequest(path=request.path))
+
+def test_delete_checks_version_and_hides_file():
+    service, request, allocation, _ = prepare_upload()
+    service.commit_upload(commit_request(request, allocation))
+    with pytest.raises(AllocationError) as exc:
+        service.Delete(pb.DeleteRequest(path=request.path, expected_version=2), Context())
+    assert exc.value.code == grpc.StatusCode.ABORTED
+    service.Delete(pb.DeleteRequest(path=request.path, expected_version=1), Context())
+    with pytest.raises(AllocationError):
+        service.resolve_download(pb.ResolveDownloadRequest(path=request.path))
+    assert not service.ListDir(pb.ListDirRequest(path="/"), Context()).entries

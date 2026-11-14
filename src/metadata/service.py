@@ -715,3 +715,23 @@ class MetadataService(rpc.MetadataServiceServicer):
                 return Empty()
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
+
+    def Delete(self, request, context):
+        try:
+            with self._transaction():
+                self._validate_path(request.path)
+                self._release_expired_uploads(int(self._clock() * 1000))
+                if request.path in self._paths:
+                    raise AllocationError(grpc.StatusCode.ABORTED, "Caminho reservado por upload")
+                stored = self._files.get(request.path)
+                if stored is None:
+                    raise AllocationError(grpc.StatusCode.NOT_FOUND, "Arquivo não encontrado")
+                metadata = pb.FileMetadata.FromString(stored)
+                if request.HasField("expected_version") and metadata.version != request.expected_version:
+                    raise AllocationError(grpc.StatusCode.ABORTED, "Versão esperada divergente")
+                metadata.state = pb.FILE_DELETED
+                metadata.updated_at_unix_ms = int(self._clock() * 1000)
+                self._files[request.path] = metadata.SerializeToString()
+                return Empty()
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))
