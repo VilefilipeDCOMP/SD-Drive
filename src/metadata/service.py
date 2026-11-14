@@ -63,6 +63,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._upload_results = {}
         self._aborted = set()
         self._directories = {"/"}
+        self._invalid_replicas = set()
         self._store = MetadataStore(db_path) if db_path is not None else None
         self._transaction_depth = 0
         if self._store is not None:
@@ -267,7 +268,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         for chunk in sorted(manifest.chunks, key=lambda chunk: chunk.index):
             location = pb.ChunkLocation(manifest=chunk)
             for target in placements[chunk.block_id].targets:
-                if target.node_id not in confirmed[chunk.block_id]:
+                if target.node_id not in confirmed[chunk.block_id] or f"{chunk.block_id}:{target.node_id}" in self._invalid_replicas:
                     continue
 
                 try:
@@ -563,7 +564,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
 
-    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started", "_directories")
+    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started", "_directories", "_invalid_replicas")
 
     def _snapshot(self):
         state = {}
@@ -787,7 +788,7 @@ class MetadataService(rpc.MetadataServiceServicer):
                         state = self._registry.get_node_state(address.node_id)
                     except KeyError:
                         state = pb.NODE_DEAD
-                    replicas.append(pb.ReplicaLocation(node=address, healthy=state in (pb.NODE_ALIVE, pb.NODE_DRAINING)))
+                    replicas.append(pb.ReplicaLocation(node=address, healthy=state in (pb.NODE_ALIVE, pb.NODE_DRAINING) and f"{chunk.block_id}:{address.node_id}" not in self._invalid_replicas))
                 records.append({"block_id": chunk.block_id, "manifest": chunk, "version": metadata.version, "desired_replica_count": metadata.desired_replica_count, "replicas": replicas})
         return records
 
@@ -840,3 +841,13 @@ class MetadataService(rpc.MetadataServiceServicer):
                         return pb.NodeAddress(node_id=node.node_id, machine_id=node.machine_id, disk_id=node.disk_id, grpc_target=node.grpc_target)
                 raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Sem destino elegível para recuperação")
             raise AllocationError(grpc.StatusCode.NOT_FOUND, "Bloco não encontrado")
+
+    def mark_replica_invalid(self, block_id, node_id):
+        with self._transaction():
+            for record in self._block_records():
+                if record["block_id"] == block_id:
+                    for replica in record["replicas"]:
+                        if replica.node.node_id == node_id:
+                            self._invalid_replicas.add(f"{block_id}:{node_id}")
+                            return
+            raise AllocationError(grpc.StatusCode.NOT_FOUND, "Réplica não encontrada")
