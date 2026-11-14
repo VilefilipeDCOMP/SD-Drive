@@ -642,3 +642,36 @@ class MetadataService(rpc.MetadataServiceServicer):
                 return pb.StatResponse(is_directory=False, file=result.file, chunks=result.chunks)
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
+
+    def ListDir(self, request, context):
+        try:
+            with self._transaction():
+                if request.path != "/":
+                    self._validate_path(request.path)
+                if request.path not in self._directories:
+                    raise AllocationError(grpc.StatusCode.NOT_FOUND, "Diretório não encontrado")
+                if request.page_size > 1000:
+                    raise AllocationError(grpc.StatusCode.INVALID_ARGUMENT, "Página excede 1000 entradas")
+                entries = []
+                for path in self._directories:
+                    if path != "/" and str(PurePosixPath(path).parent) == request.path:
+                        entries.append(pb.DirectoryEntry(path=path, is_directory=True))
+                for path, stored in self._files.items():
+                    metadata = pb.FileMetadata.FromString(stored)
+                    if metadata.state == pb.FILE_COMMITTED and str(PurePosixPath(path).parent) == request.path:
+                        entries.append(pb.DirectoryEntry(path=path, size_bytes=metadata.plaintext_size_bytes))
+                entries.sort(key=lambda entry: entry.path)
+                start = 0
+                if request.page_token:
+                    paths = [entry.path for entry in entries]
+                    if request.page_token not in paths:
+                        raise AllocationError(grpc.StatusCode.INVALID_ARGUMENT, "Token de paginação inválido")
+                    start = paths.index(request.page_token) + 1
+                size = request.page_size or 100
+                page = entries[start:start + size]
+                token = ""
+                if start + size < len(entries):
+                    token = page[-1].path
+                return pb.ListDirResponse(entries=page, next_page_token=token)
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))
