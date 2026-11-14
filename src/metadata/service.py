@@ -770,3 +770,54 @@ class MetadataService(rpc.MetadataServiceServicer):
                 return Empty()
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
+
+    def _block_records(self):
+        records = []
+        for stored in self._files.values():
+            metadata = pb.FileMetadata.FromString(stored)
+            if metadata.state != pb.FILE_COMMITTED:
+                continue
+            manifest, allocation, confirmed = self._find_committed_upload(metadata)
+            for chunk, placement in zip(manifest.chunks, allocation.chunks):
+                replicas = []
+                for address in placement.targets:
+                    if address.node_id not in confirmed[chunk.block_id]:
+                        continue
+                    try:
+                        state = self._registry.get_node_state(address.node_id)
+                    except KeyError:
+                        state = pb.NODE_DEAD
+                    replicas.append(pb.ReplicaLocation(node=address, healthy=state in (pb.NODE_ALIVE, pb.NODE_DRAINING)))
+                records.append({"block_id": chunk.block_id, "manifest": chunk, "version": metadata.version, "desired_replica_count": metadata.desired_replica_count, "replicas": replicas})
+        return records
+
+    def list_blocks_on_node(self, node_id):
+        with self._transaction():
+            result = []
+            for record in self._block_records():
+                for replica in record["replicas"]:
+                    if replica.node.node_id == node_id:
+                        result.append(record)
+                        break
+            return result
+
+    def list_healthy_sources(self, block_id):
+        with self._transaction():
+            for record in self._block_records():
+                if record["block_id"] == block_id:
+                    return [replica.node for replica in record["replicas"] if replica.healthy]
+            return []
+
+    def list_under_replicated_blocks(self):
+        with self._transaction():
+            result = []
+            for record in self._block_records():
+                count = 0
+                for replica in record["replicas"]:
+                    if replica.healthy:
+                        count += 1
+                if count < record["desired_replica_count"]:
+                    record["live_replica_count"] = count
+                    result.append(record)
+            result.sort(key=lambda record: record["live_replica_count"])
+            return result
