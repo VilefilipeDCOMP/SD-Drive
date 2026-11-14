@@ -37,3 +37,14 @@ def test_listdir_paginates_visible_children():
     assert [e.path for e in first.entries] == ["/pasta"]
     assert [e.path for e in second.entries] == ["/teste.txt"]
     assert not second.next_page_token
+
+def test_rename_moves_directory_tree_without_changing_blocks():
+    service, request, allocation, _ = prepare_upload()
+    service.commit_upload(commit_request(request, allocation))
+    service.Mkdir(pb.MkdirRequest(path="/pasta"), Context())
+    service.Rename(pb.RenameRequest(source_path=request.path, target_path="/pasta/a.txt"), Context())
+    service.Rename(pb.RenameRequest(source_path="/pasta", target_path="/nova"), Context())
+    result = service.resolve_download(pb.ResolveDownloadRequest(path="/nova/a.txt"))
+    assert result.chunks[0].manifest.block_id == request.chunks[0].block_id
+    with pytest.raises(AllocationError):
+        service.resolve_download(pb.ResolveDownloadRequest(path=request.path))

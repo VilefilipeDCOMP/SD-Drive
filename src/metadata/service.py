@@ -675,3 +675,43 @@ class MetadataService(rpc.MetadataServiceServicer):
                 return pb.ListDirResponse(entries=page, next_page_token=token)
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
+
+    def Rename(self, request, context):
+        try:
+            with self._transaction():
+                source = request.source_path
+                target = request.target_path
+                self._validate_path(source)
+                self._validate_path(target)
+                self._release_expired_uploads(int(self._clock() * 1000))
+                source_is_dir = source in self._directories
+                stored = self._files.get(source)
+                if not source_is_dir and (stored is None or pb.FileMetadata.FromString(stored).state != pb.FILE_COMMITTED):
+                    raise AllocationError(grpc.StatusCode.NOT_FOUND, "Origem não encontrada")
+                if source == target:
+                    return Empty()
+                if target.startswith(source + "/"):
+                    raise AllocationError(grpc.StatusCode.INVALID_ARGUMENT, "Destino dentro da própria origem")
+                for path in self._paths:
+                    if path == source or path.startswith(source + "/") or path == target or path.startswith(target + "/"):
+                        raise AllocationError(grpc.StatusCode.ABORTED, "Caminho reservado por upload")
+                if target in self._directories:
+                    raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Diretório de destino já existe")
+                destination = self._files.get(target)
+                if destination is not None and pb.FileMetadata.FromString(destination).state == pb.FILE_COMMITTED:
+                    if source_is_dir or not request.overwrite:
+                        raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Destino já existe")
+                for path in list(self._files):
+                    if path == source or (source_is_dir and path.startswith(source + "/")):
+                        metadata = pb.FileMetadata.FromString(self._files.pop(path))
+                        metadata.path = target + path[len(source):]
+                        metadata.updated_at_unix_ms = int(self._clock() * 1000)
+                        self._files[metadata.path] = metadata.SerializeToString()
+                if source_is_dir:
+                    for path in list(self._directories):
+                        if path == source or path.startswith(source + "/"):
+                            self._directories.remove(path)
+                            self._directories.add(target + path[len(source):])
+                return Empty()
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))
