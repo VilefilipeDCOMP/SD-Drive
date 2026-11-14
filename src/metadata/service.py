@@ -888,3 +888,25 @@ class MetadataService(rpc.MetadataServiceServicer):
                     self._operations[manifest.operation_id] = replace(pending, response=allocation.SerializeToString())
                     return
             raise AllocationError(grpc.StatusCode.NOT_FOUND, "Bloco não encontrado")
+
+    def gc_candidates(self):
+        with self._transaction():
+            self._release_expired_uploads(int(self._clock() * 1000))
+            protected = set()
+            for record in self._block_records():
+                protected.add(record["block_id"])
+            for pending in self._paths.values():
+                manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
+                for chunk in manifest.chunks:
+                    protected.add(chunk.block_id)
+            candidates = {}
+            for pending in self._operations.values():
+                manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
+                allocation = pb.AllocateUploadResponse.FromString(pending.response)
+                for chunk, placement in zip(manifest.chunks, allocation.chunks):
+                    if chunk.block_id in protected:
+                        continue
+                    for node in placement.targets:
+                        key = f"{chunk.block_id}:{node.node_id}"
+                        candidates[key] = {"block_id": chunk.block_id, "node": node, "stored_size_bytes": chunk.stored_size_bytes, "version": allocation.version}
+            return list(candidates.values())

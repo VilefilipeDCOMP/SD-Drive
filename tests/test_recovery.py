@@ -47,3 +47,19 @@ def test_recovered_receipt_restores_replication_without_breaking_commit_retry():
     assert service.list_under_replicated_blocks() == []
     assert service.commit_upload(original) == result
     assert len(service.resolve_download(pb.ResolveDownloadRequest(path=request.path)).chunks[0].replicas) == 3
+
+def test_gc_protects_active_versions_and_pending_but_exposes_deleted_blocks():
+    service, request, allocation, _ = prepare_upload()
+    assert service.gc_candidates() == []
+    service.commit_upload(commit_request(request, allocation))
+    assert service.gc_candidates() == []
+    service.Delete(pb.DeleteRequest(path=request.path), Context())
+    candidates = service.gc_candidates()
+    assert len(candidates) == 3
+    assert {item["block_id"] for item in candidates} == {request.chunks[0].block_id}
+
+def test_gc_includes_expired_and_cancelled_partial_uploads():
+    service, request, allocation, now = prepare_upload()
+    now[0] += 10
+    assert len(service.gc_candidates()) == 3
+    assert not service._reserved
