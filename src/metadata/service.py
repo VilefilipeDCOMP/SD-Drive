@@ -6,6 +6,7 @@ from itertools import combinations
 from pathlib import PurePosixPath
 from threading import RLock
 import time
+import copy
 from typing import Callable
 from uuid import UUID, uuid4
 
@@ -64,6 +65,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._aborted = set()
         self._directories = {"/"}
         self._invalid_replicas = set()
+        self._original_receipts = {}
         self._store = MetadataStore(db_path) if db_path is not None else None
         self._transaction_depth = 0
         if self._store is not None:
@@ -127,7 +129,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
             manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
             confirmed = self._validate_receipts(manifest, allocation, req.receipts)
-            previous = self._committed_receipts.get(req.upload_id)
+            previous = self._original_receipts.get(req.upload_id, self._committed_receipts.get(req.upload_id))
 
             if previous is not None:
                 if confirmed != previous:
@@ -564,7 +566,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
 
-    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started", "_directories", "_invalid_replicas")
+    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started", "_directories", "_invalid_replicas", "_original_receipts")
 
     def _snapshot(self):
         state = {}
@@ -851,3 +853,38 @@ class MetadataService(rpc.MetadataServiceServicer):
                             self._invalid_replicas.add(f"{block_id}:{node_id}")
                             return
             raise AllocationError(grpc.StatusCode.NOT_FOUND, "Réplica não encontrada")
+
+    def register_recovered_replica(self, block_id, receipt):
+        with self._transaction():
+            for stored in self._files.values():
+                metadata = pb.FileMetadata.FromString(stored)
+                if metadata.state != pb.FILE_COMMITTED:
+                    continue
+                manifest, allocation, confirmed = self._find_committed_upload(metadata)
+                for chunk, placement in zip(manifest.chunks, allocation.chunks):
+                    if chunk.block_id != block_id:
+                        continue
+                    if receipt.block_id != block_id or receipt.stored_size_bytes != chunk.stored_size_bytes or receipt.verified_storage_sha256 != chunk.storage_sha256:
+                        raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Recibo recuperado difere do manifesto")
+                    if receipt.node_id not in confirmed[block_id]:
+                        try:
+                            node = self._registry.get_node_capacity(receipt.node_id)
+                        except KeyError:
+                            raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Nó recuperado não registrado")
+                        if node.state != pb.NODE_ALIVE:
+                            raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Destino recuperado não está ALIVE")
+                        if len(self.list_healthy_sources(block_id)) >= metadata.desired_replica_count:
+                            raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Bloco já possui réplicas suficientes")
+                        for address in placement.targets:
+                            if address.node_id in confirmed[block_id] and (address.machine_id == node.machine_id or address.disk_id == node.disk_id):
+                                raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Domínio de réplica repetido")
+                        if receipt.node_id not in [address.node_id for address in placement.targets]:
+                            placement.targets.append(pb.NodeAddress(node_id=node.node_id, machine_id=node.machine_id, disk_id=node.disk_id, grpc_target=node.grpc_target))
+                    if allocation.upload_id not in self._original_receipts:
+                        self._original_receipts[allocation.upload_id] = copy.deepcopy(confirmed)
+                    confirmed[block_id][receipt.node_id] = receipt.SerializeToString()
+                    self._invalid_replicas.discard(f"{block_id}:{receipt.node_id}")
+                    pending = self._operations[manifest.operation_id]
+                    self._operations[manifest.operation_id] = replace(pending, response=allocation.SerializeToString())
+                    return
+            raise AllocationError(grpc.StatusCode.NOT_FOUND, "Bloco não encontrado")

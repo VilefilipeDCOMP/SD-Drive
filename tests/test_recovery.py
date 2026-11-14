@@ -35,3 +35,15 @@ def test_invalid_replica_is_excluded_from_download_and_sources():
     result = service.resolve_download(pb.ResolveDownloadRequest(path=request.path))
     assert len(result.chunks[0].replicas) == 2
     assert result.file.replication_state == pb.REPLICATION_UNDER_REPLICATED
+
+def test_recovered_receipt_restores_replication_without_breaking_commit_retry():
+    service, request, allocation, _ = prepare_upload(write_quorum=2)
+    original = commit_request(request, allocation, copies=2)
+    result = service.commit_upload(original)
+    target = service.select_destination(request.chunks[0].block_id, set())
+    receipt = pb.BlockReceipt(block_id=request.chunks[0].block_id, node_id=target.node_id, stored_size_bytes=100, verified_storage_sha256=b"b" * 32)
+    service.register_recovered_replica(receipt.block_id, receipt)
+    service.register_recovered_replica(receipt.block_id, receipt)
+    assert service.list_under_replicated_blocks() == []
+    assert service.commit_upload(original) == result
+    assert len(service.resolve_download(pb.ResolveDownloadRequest(path=request.path)).chunks[0].replicas) == 3
