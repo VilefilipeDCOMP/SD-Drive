@@ -59,3 +59,14 @@ def test_delete_checks_version_and_hides_file():
     with pytest.raises(AllocationError):
         service.resolve_download(pb.ResolveDownloadRequest(path=request.path))
     assert not service.ListDir(pb.ListDirRequest(path="/"), Context()).entries
+
+def test_rmdir_rejects_nonempty_then_removes_tree_recursively():
+    service, request, allocation, _ = prepare_upload()
+    service.commit_upload(commit_request(request, allocation))
+    service.Mkdir(pb.MkdirRequest(path="/pasta"), Context())
+    service.Rename(pb.RenameRequest(source_path=request.path, target_path="/pasta/a.txt"), Context())
+    with pytest.raises(AllocationError) as exc:
+        service.Rmdir(pb.RmdirRequest(path="/pasta"), Context())
+    assert exc.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    service.Rmdir(pb.RmdirRequest(path="/pasta", recursive=True), Context())
+    assert not service.ListDir(pb.ListDirRequest(path="/"), Context()).entries

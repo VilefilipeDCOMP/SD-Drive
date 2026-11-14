@@ -735,3 +735,38 @@ class MetadataService(rpc.MetadataServiceServicer):
                 return Empty()
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
+
+    def Rmdir(self, request, context):
+        try:
+            with self._transaction():
+                if request.path == "/":
+                    raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Não é permitido remover a raiz")
+                self._validate_path(request.path)
+                if request.path not in self._directories:
+                    raise AllocationError(grpc.StatusCode.NOT_FOUND, "Diretório não encontrado")
+                self._release_expired_uploads(int(self._clock() * 1000))
+                prefix = request.path + "/"
+                for path in self._paths:
+                    if path.startswith(prefix):
+                        raise AllocationError(grpc.StatusCode.ABORTED, "Diretório contém upload em andamento")
+                directories = []
+                files = []
+                for path in self._directories:
+                    if path.startswith(prefix):
+                        directories.append(path)
+                for path, stored in self._files.items():
+                    if path.startswith(prefix) and pb.FileMetadata.FromString(stored).state == pb.FILE_COMMITTED:
+                        files.append(path)
+                if (directories or files) and not request.recursive:
+                    raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Diretório não está vazio")
+                for path in files:
+                    metadata = pb.FileMetadata.FromString(self._files[path])
+                    metadata.state = pb.FILE_DELETED
+                    metadata.updated_at_unix_ms = int(self._clock() * 1000)
+                    self._files[path] = metadata.SerializeToString()
+                for path in directories:
+                    self._directories.remove(path)
+                self._directories.remove(request.path)
+                return Empty()
+        except AllocationError as exc:
+            context.abort(exc.code, str(exc))
