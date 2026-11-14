@@ -821,3 +821,22 @@ class MetadataService(rpc.MetadataServiceServicer):
                     result.append(record)
             result.sort(key=lambda record: record["live_replica_count"])
             return result
+
+    def select_destination(self, block_id, excluded_node_ids):
+        with self._transaction():
+            for record in self._block_records():
+                if record["block_id"] != block_id:
+                    continue
+                excluded = set(excluded_node_ids)
+                machines = set()
+                disks = set()
+                for replica in record["replicas"]:
+                    excluded.add(replica.node.node_id)
+                    machines.add(replica.node.machine_id)
+                    disks.add(replica.node.disk_id)
+                candidates = self._filter_eligible_nodes(self._registry.list_eligible_nodes(), excluded, record["manifest"].stored_size_bytes, self._reserved)
+                for node in sorted(candidates, key=lambda node: node.node_id):
+                    if node.machine_id not in machines and node.disk_id not in disks:
+                        return pb.NodeAddress(node_id=node.node_id, machine_id=node.machine_id, disk_id=node.disk_id, grpc_target=node.grpc_target)
+                raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Sem destino elegível para recuperação")
+            raise AllocationError(grpc.StatusCode.NOT_FOUND, "Bloco não encontrado")

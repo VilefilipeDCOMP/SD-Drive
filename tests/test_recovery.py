@@ -13,3 +13,13 @@ def test_recovery_queries_only_reference_active_committed_blocks():
     assert service.list_blocks_on_node(node_id)[0]["block_id"] == block_id
     service.Delete(pb.DeleteRequest(path=request.path), Context())
     assert service.list_blocks_on_node(node_id) == []
+
+def test_recovery_destination_respects_existing_domains_and_exclusions():
+    service, request, allocation, _ = prepare_upload(write_quorum=2)
+    service.commit_upload(commit_request(request, allocation, copies=2))
+    destination = service.select_destination(request.chunks[0].block_id, set())
+    assert destination.node_id == allocation.chunks[0].targets[2].node_id
+    import pytest
+    from metadata.service import AllocationError
+    with pytest.raises(AllocationError):
+        service.select_destination(request.chunks[0].block_id, {destination.node_id})
