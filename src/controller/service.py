@@ -1,0 +1,240 @@
+from __future__ import annotations
+
+import grpc
+
+from src.common.logging_config import get_logger
+from src.common.ports import MetadataPort
+from src.controller.node_registry import NodeRegistry
+from src.controller.recovery import RecoveryManager
+from src.controller.reconciliation import ReconciliationService, InventoryItem
+
+logger = get_logger("controller.service")
+
+try:
+    from src import dcomp_drive_pb2 as pb2
+    from src import dcomp_drive_pb2_grpc as pb2_grpc
+    _PROTO_AVAILABLE = True
+except ImportError:
+    _PROTO_AVAILABLE = False
+
+
+class ControlServicer:
+
+    def __init__(
+        self,
+        node_registry: NodeRegistry,
+        metadata_port: MetadataPort,
+        recovery_manager: RecoveryManager,
+    ) -> None:
+        self._registry = node_registry
+        self._meta = metadata_port
+        self._recovery = recovery_manager
+        self._reconciler = ReconciliationService(metadata_port)
+
+    def RegisterNode(self, request, context):
+        node = request.node
+        try:
+            config = self._registry.register_node(
+                node_id=node.node_id,
+                machine_id=node.machine_id,
+                disk_id=node.disk_id,
+                grpc_target=node.grpc_target,
+                boot_id=request.boot_id,
+                total_bytes=request.total_bytes,
+                used_bytes=request.used_bytes,
+            )
+            if not _PROTO_AVAILABLE:
+                return config
+
+            return pb2.RegisterNodeResponse(
+                heartbeat_interval_seconds=config["heartbeat_interval_seconds"],
+                suspect_timeout_seconds=config["suspect_timeout_seconds"],
+                dead_timeout_seconds=config["dead_timeout_seconds"],
+            )
+        except Exception as exc:
+            logger.error(
+                "Erro em RegisterNode",
+                extra={"event": "rpc.register_node.error", "error": str(exc)},
+            )
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(exc))
+            return pb2.RegisterNodeResponse() if _PROTO_AVAILABLE else {}
+
+    def Heartbeat(self, request, context):
+        recognized = self._registry.process_heartbeat(
+            node_id=request.node_id,
+            boot_id=request.boot_id,
+            total_bytes=request.total_bytes,
+            used_bytes=request.used_bytes,
+            available_bytes=request.available_bytes,
+        )
+        if not recognized:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(
+                f"Nó {request.node_id!r} não reconhecido; chame RegisterNode."
+            )
+            if _PROTO_AVAILABLE:
+                from google.protobuf import empty_pb2
+                return empty_pb2.Empty()
+            return {}
+
+        if _PROTO_AVAILABLE:
+            from google.protobuf import empty_pb2
+            return empty_pb2.Empty()
+        return {}
+
+    def ReportCorruption(self, request, context):
+        try:
+            self._recovery.handle_corruption_report(
+                block_id=request.block_id,
+                suspected_node_id=request.suspected_node_id,
+                observed_sha256=bytes(request.observed_sha256),
+                reporter_id=request.reporter_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "Erro em ReportCorruption",
+                extra={
+                    "event": "rpc.report_corruption.error",
+                    "block_id": request.block_id,
+                    "error": str(exc),
+                },
+            )
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(exc))
+
+        if _PROTO_AVAILABLE:
+            from google.protobuf import empty_pb2
+            return empty_pb2.Empty()
+        return {}
+
+    def Reconcile(self, request_iterator, context):
+        node_id = None
+        boot_id = None
+
+        def _gen_batches():
+            nonlocal node_id, boot_id
+            for batch in request_iterator:
+                if node_id is None:
+                    node_id = batch.node_id
+                    boot_id = batch.boot_id
+                items = [
+                    InventoryItem(
+                        block_id=b.block_id,
+                        version=b.version,
+                        stored_size_bytes=b.stored_size_bytes,
+                        storage_sha256=bytes(b.storage_sha256),
+                    )
+                    for b in batch.blocks
+                ]
+                yield (batch.node_id, batch.boot_id, items)
+
+        try:
+            obsolete = self._reconciler.reconcile(
+                node_id=node_id or "",
+                boot_id=boot_id or "",
+                inventory_batches=_gen_batches(),
+            )
+        except Exception as exc:
+            logger.error(
+                "Erro em Reconcile",
+                extra={"event": "rpc.reconcile.error", "error": str(exc)},
+            )
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(exc))
+            if _PROTO_AVAILABLE:
+                return pb2.ReconcileResponse()
+            return {"obsolete_block_ids": []}
+
+        if _PROTO_AVAILABLE:
+            return pb2.ReconcileResponse(obsolete_block_ids=obsolete)
+        return {"obsolete_block_ids": obsolete}
+
+    def GetStatus(self, request, context):
+        nodes_info = self._registry.get_all_nodes()
+
+        node_statuses = []
+        if _PROTO_AVAILABLE:
+            _state_map = {
+                "ALIVE": pb2.NODE_ALIVE,
+                "SUSPECT": pb2.NODE_SUSPECT,
+                "DEAD": pb2.NODE_DEAD,
+                "DRAINING": pb2.NODE_DRAINING,
+            }
+            for n in nodes_info:
+                node_statuses.append(
+                    pb2.NodeStatus(
+                        node=pb2.NodeAddress(
+                            node_id=n.node_id,
+                            machine_id=n.machine_id,
+                            disk_id=n.disk_id,
+                            grpc_target=n.grpc_target,
+                        ),
+                        state=_state_map.get(n.state, pb2.NODE_STATE_UNSPECIFIED),
+                        total_bytes=n.total_bytes,
+                        used_bytes=n.used_bytes,
+                        available_bytes=n.available_bytes,
+                    )
+                )
+
+        healthy = under_rep = recovering = unavailable = 0
+        try:
+            blocks = self._meta.list_under_replicated_blocks()
+            under_rep = len(blocks)
+        except Exception:
+            pass
+
+        running_jobs = self._recovery.running_job_count()
+
+        if _PROTO_AVAILABLE:
+            return pb2.GetStatusResponse(
+                nodes=node_statuses,
+                healthy_files=healthy,
+                under_replicated_files=under_rep,
+                recovering_files=recovering,
+                unavailable_files=unavailable,
+                running_recovery_jobs=running_jobs,
+            )
+        return {
+            "nodes": [n.__dict__ for n in nodes_info],
+            "healthy_files": healthy,
+            "under_replicated_files": under_rep,
+            "recovering_files": recovering,
+            "unavailable_files": unavailable,
+            "running_recovery_jobs": running_jobs,
+        }
+
+    def DrainNode(self, request, context):
+        node_id = request.node_id
+
+        state = self._registry.get_node_state(node_id)
+        if state is None:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(f"Nó {node_id!r} não encontrado.")
+            if _PROTO_AVAILABLE:
+                return pb2.DrainNodeResponse()
+            return {"job_id": ""}
+
+        if state == "DRAINING":
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details(f"Nó {node_id!r} já está em DRAINING.")
+            if _PROTO_AVAILABLE:
+                return pb2.DrainNodeResponse()
+            return {"job_id": ""}
+
+        self._registry.set_draining(node_id)
+
+        job_id = self._recovery.drain_node(node_id)
+
+        logger.info(
+            "DrainNode iniciado",
+            extra={
+                "event": "drain.rpc_accepted",
+                "node_id": node_id,
+                "job_id": job_id,
+            },
+        )
+
+        if _PROTO_AVAILABLE:
+            return pb2.DrainNodeResponse(job_id=job_id)
+        return {"job_id": job_id}

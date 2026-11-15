@@ -1,0 +1,39 @@
+# Valores de referencia adotados para a Parte 1; N, W e outros parametros configuraveis.
+cluster:
+  replication_factor: 3
+  write_quorum: "all"  # W=N; tambem aceita inteiro 1..N (valor invalido rejeitado)
+  reject_when_insufficient_distinct_nodes: true
+  max_disk_usage_fraction: 0.90
+controller:
+  grpc_bind: "0.0.0.0:50051"
+  metadata_db_path: "/data/metadata.db"
+  heartbeat_interval_seconds: 3
+  suspect_timeout_seconds: 10
+  dead_timeout_seconds: 30
+  max_concurrent_recoveries: 2
+  upload_lease_seconds: 900        # 15 min; renovavel enquanto upload PENDING
+  upload_max_lifetime_seconds: 14400  # 4 h por tentativa; impede lease eterno
+  placement_eligible_node_states: ["ALIVE"]  # SUSPECT/DEAD/DRAINING inelegiveis
+storage:
+  grpc_bind: "0.0.0.0:50052"
+  block_directory: "/data/blocks"
+  capacity_bytes: 10737418240     # cota LOGICA de 10 GiB por no; env DCOMP_STORAGE_CAPACITY_BYTES sobrescreve por container
+  scrub_interval_seconds: 60
+client:
+  central_target: "controller:50051"  # CLI executada na MESMA rede Compose dos nos (padrao suportado)
+  logical_chunk_size_bytes: 4194304   # 4 MiB
+  grpc_frame_size_bytes: 262144       # 256 KiB por mensagem
+  lease_renew_interval_seconds: 180   # antes do vencimento; nao em cada frame
+  upload_rpc_deadline_seconds: 45     # configuravel por ambiente
+  upload_retry_max_attempts: 3       # total de tentativas, contando a primeira; novo operation_id apos abort
+  upload_retry_backoff_initial_seconds: 1.0  # intervalo inicial entre tentativas
+  upload_retry_backoff_max_seconds: 4.0      # teto de backoff exponencial
+  upload_retry_backoff_jitter_fraction: 0.2 # varia o intervalo em +/-20%
+  encryption_enabled: false          # obrigatoriamente suportar true/false
+  encryption_algorithm: "AES-256-GCM"
+  # Chave criptografica nunca entra neste arquivo/repo; fornecer no cliente por segredo.
+observability:
+  metrics_port: 9100           # porta INTERNA de cada container; publicar no host requer portas distintas
+  log_format: "json"
+  client_events_path: "/logs/client.jsonl"  # volume acessivel a CLI efemera
+  fault_events_path: "/logs/faults.jsonl"   # registro de injecao (Parte 2)
