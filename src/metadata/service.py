@@ -71,6 +71,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._original_receipts = {}
         self._block_reservations = {}
         self._gc_confirmed = set()
+        self._recovering_blocks = set()
         self._store = MetadataStore(db_path) if db_path is not None else None
         self._transaction_depth = 0
         if self._store is not None:
@@ -290,9 +291,11 @@ class MetadataService(rpc.MetadataServiceServicer):
 
             if len(location.replicas) == 0:
                 replication_state = pb.REPLICATION_UNAVAILABLE
-            elif len(location.replicas) < allocation.replication_factor and replication_state != pb.REPLICATION_UNAVAILABLE:
+            elif len(location.replicas) < allocation.replication_factor and replication_state not in (pb.REPLICATION_UNAVAILABLE, pb.REPLICATION_RECOVERING):
                 replication_state = pb.REPLICATION_UNDER_REPLICATED
 
+            if replication_state == pb.REPLICATION_UNDER_REPLICATED and chunk.block_id in self._recovering_blocks:
+                replication_state = pb.REPLICATION_RECOVERING
             chunks.append(location)
 
         return chunks, replication_state
@@ -581,7 +584,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
 
-    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started", "_directories", "_invalid_replicas", "_original_receipts", "_block_reservations", "_gc_confirmed")
+    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started", "_directories", "_invalid_replicas", "_original_receipts", "_block_reservations", "_gc_confirmed", "_recovering_blocks")
 
     def _snapshot(self):
         state = {}
@@ -909,6 +912,8 @@ class MetadataService(rpc.MetadataServiceServicer):
                     self._invalid_replicas.discard(f"{block_id}:{receipt.node_id}")
                     pending = self._operations[manifest.operation_id]
                     self._operations[manifest.operation_id] = replace(pending, response=allocation.SerializeToString())
+                    if len(self.list_healthy_sources(block_id)) >= metadata.desired_replica_count:
+                        self._recovering_blocks.discard(block_id)
                     return
             raise AllocationError(grpc.StatusCode.NOT_FOUND, "Bloco não encontrado")
 
@@ -958,3 +963,15 @@ class MetadataService(rpc.MetadataServiceServicer):
                     self._gc_confirmed.add(key)
                     return
             raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Bloco ainda referenciado ou sem ordem de limpeza")
+
+    def set_recovery_state(self, block_id, recovering):
+        """O controlador informa o início e o encerramento de seu job de cópia."""
+        with self._transaction("set_recovery_state"):
+            for record in self._block_records():
+                if record["block_id"] == block_id:
+                    if recovering:
+                        self._recovering_blocks.add(block_id)
+                    else:
+                        self._recovering_blocks.discard(block_id)
+                    return
+            raise AllocationError(grpc.StatusCode.NOT_FOUND, "Bloco não encontrado")

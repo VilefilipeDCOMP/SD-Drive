@@ -77,3 +77,11 @@ def test_confirmed_gc_releases_capacity_once_and_rejects_active_blocks():
         service.acknowledge_gc(candidate["block_id"], candidate["node"].node_id)
     assert service.gc_candidates() == []
     assert not service._reserved
+
+def test_controller_can_report_recovery_job_state():
+    service, request, allocation, _ = prepare_upload(write_quorum=2)
+    service.commit_upload(commit_request(request, allocation, copies=2))
+    service.set_recovery_state(request.chunks[0].block_id, True)
+    assert service.resolve_download(pb.ResolveDownloadRequest(path=request.path)).file.replication_state == pb.REPLICATION_RECOVERING
+    service.set_recovery_state(request.chunks[0].block_id, False)
+    assert service.resolve_download(pb.ResolveDownloadRequest(path=request.path)).file.replication_state == pb.REPLICATION_UNDER_REPLICATED
