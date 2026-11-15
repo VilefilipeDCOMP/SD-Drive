@@ -85,3 +85,12 @@ def test_controller_can_report_recovery_job_state():
     assert service.resolve_download(pb.ResolveDownloadRequest(path=request.path)).file.replication_state == pb.REPLICATION_RECOVERING
     service.set_recovery_state(request.chunks[0].block_id, False)
     assert service.resolve_download(pb.ResolveDownloadRequest(path=request.path)).file.replication_state == pb.REPLICATION_UNDER_REPLICATED
+
+def test_recovery_source_uses_current_address_after_node_restart():
+    from dataclasses import replace
+    service, request, allocation, _ = prepare_upload()
+    service.commit_upload(commit_request(request, allocation))
+    node_id = allocation.chunks[0].targets[0].node_id
+    registry = service._registry
+    registry._nodes[node_id] = replace(registry._nodes[node_id], grpc_target="novo:50052")
+    assert service.list_healthy_sources(request.chunks[0].block_id)[0].grpc_target == "novo:50052"

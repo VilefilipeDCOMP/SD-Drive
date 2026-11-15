@@ -273,6 +273,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
         chunks = []
         replication_state = pb.REPLICATION_HEALTHY
+        recovering = False
         for chunk in sorted(manifest.chunks, key=lambda chunk: chunk.index):
             location = pb.ChunkLocation(manifest=chunk)
             for target in placements[chunk.block_id].targets:
@@ -291,13 +292,15 @@ class MetadataService(rpc.MetadataServiceServicer):
 
             if len(location.replicas) == 0:
                 replication_state = pb.REPLICATION_UNAVAILABLE
-            elif len(location.replicas) < allocation.replication_factor and replication_state not in (pb.REPLICATION_UNAVAILABLE, pb.REPLICATION_RECOVERING):
+            elif len(location.replicas) < allocation.replication_factor and replication_state != pb.REPLICATION_UNAVAILABLE:
                 replication_state = pb.REPLICATION_UNDER_REPLICATED
 
-            if replication_state == pb.REPLICATION_UNDER_REPLICATED and chunk.block_id in self._recovering_blocks:
-                replication_state = pb.REPLICATION_RECOVERING
+            if 0 < len(location.replicas) < allocation.replication_factor and chunk.block_id in self._recovering_blocks:
+                recovering = True
             chunks.append(location)
 
+        if replication_state == pb.REPLICATION_UNDER_REPLICATED and recovering:
+            replication_state = pb.REPLICATION_RECOVERING
         return chunks, replication_state
 
     def _prepare_request(self, request):
@@ -813,7 +816,9 @@ class MetadataService(rpc.MetadataServiceServicer):
                     if address.node_id not in confirmed[chunk.block_id]:
                         continue
                     try:
-                        state = self._registry.get_node_state(address.node_id)
+                        node = self._registry.get_node_capacity(address.node_id)
+                        state = node.state
+                        address = pb.NodeAddress(node_id=node.node_id, machine_id=node.machine_id, disk_id=node.disk_id, grpc_target=node.grpc_target)
                     except KeyError:
                         state = pb.NODE_DEAD
                     replicas.append(pb.ReplicaLocation(node=address, healthy=state in (pb.NODE_ALIVE, pb.NODE_DRAINING) and f"{chunk.block_id}:{address.node_id}" not in self._invalid_replicas))
