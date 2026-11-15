@@ -1,0 +1,281 @@
+syntax = "proto3";
+
+package dcompdrive.v1;
+
+import "google/protobuf/empty.proto";
+
+
+enum FileState {
+  FILE_STATE_UNSPECIFIED = 0;
+  FILE_PENDING = 1;
+  FILE_COMMITTED = 2;
+  FILE_DELETED = 3;
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_ALIVE = 1;
+  NODE_SUSPECT = 2;
+  NODE_DEAD = 3;
+  NODE_DRAINING = 4;
+}
+
+enum ReplicationState {
+  REPLICATION_STATE_UNSPECIFIED = 0;
+  REPLICATION_HEALTHY = 1;
+  REPLICATION_UNDER_REPLICATED = 2;
+  REPLICATION_RECOVERING = 3;
+  REPLICATION_UNAVAILABLE = 4;
+}
+
+enum EncryptionMode {
+  ENCRYPTION_MODE_UNSPECIFIED = 0;
+  ENCRYPTION_NONE = 1;
+  ENCRYPTION_AES_256_GCM = 2;
+}
+
+message NodeAddress {
+  string node_id = 1;        // UUID estavel (persistido em volume)
+  string machine_id = 2;     // dominio de falha da maquina
+  string disk_id = 3;        // identificador de disco/volume
+  string grpc_target = 4;    // ex: storage-1:50052, acessivel ao cliente
+}
+
+message ChunkManifest {
+  string block_id = 1;           // UUID unico para o bloco/versao
+  uint32 index = 2;              // indices contiguos iniciando em zero
+  uint64 stored_size_bytes = 3;  // comprimento dos bytes armazenados
+  bytes storage_sha256 = 4;      // 32 bytes; sobre bytes armazenados
+  bytes nonce = 5;               // 12 bytes AES-GCM; vazio sem cifra
+}
+
+message ChunkPlacement {
+  string block_id = 1;
+  uint32 index = 2;
+  repeated NodeAddress targets = 3;
+}
+
+message ReplicaLocation {
+  NodeAddress node = 1;
+  bool healthy = 2;
+}
+
+message ChunkLocation {
+  ChunkManifest manifest = 1;
+  repeated ReplicaLocation replicas = 2;
+}
+
+message FileMetadata {
+  string file_id = 1;
+  string path = 2;
+  uint64 version = 3;
+  uint64 plaintext_size_bytes = 4;
+  bytes plaintext_sha256 = 5; // hash do arquivo original
+  EncryptionMode encryption = 6;
+  FileState state = 7;
+  ReplicationState replication_state = 8;
+  uint32 desired_replica_count = 9;
+  int64 created_at_unix_ms = 10;
+  int64 updated_at_unix_ms = 11;
+}
+
+message BlockReceipt {
+  string block_id = 1;
+  string node_id = 2;
+  uint64 stored_size_bytes = 3;
+  bytes verified_storage_sha256 = 4;
+}
+
+// PESSOA 1: namespace, estado, posicionamento e persistencia.
+service MetadataService {
+  rpc AllocateUpload(AllocateUploadRequest) returns (AllocateUploadResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc CommitUpload(CommitUploadRequest) returns (FileMetadata);
+  rpc AbortUpload(AbortUploadRequest) returns (google.protobuf.Empty);
+  rpc ResolveDownload(ResolveDownloadRequest) returns (ResolveDownloadResponse);
+  rpc Delete(DeleteRequest) returns (google.protobuf.Empty);
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc Rename(RenameRequest) returns (google.protobuf.Empty);
+  rpc Mkdir(MkdirRequest) returns (google.protobuf.Empty);
+  rpc Rmdir(RmdirRequest) returns (google.protobuf.Empty);
+}
+
+message AllocateUploadRequest {
+  string path = 1;
+  string operation_id = 2;         // UUID; retry repete posicionamento da mesma tentativa, nao realoca
+  uint64 plaintext_size_bytes = 3;
+  bytes plaintext_sha256 = 4;
+  EncryptionMode encryption = 5;
+  repeated ChunkManifest chunks = 6;
+  bool overwrite = 7;
+  optional uint64 expected_version = 8; // opcional; compare-and-swap
+  repeated string excluded_node_ids = 9; // nos que falharam em tentativas anteriores; aplicar ao placement
+}
+
+message AllocateUploadResponse {
+  string upload_id = 1;
+  string file_id = 2;
+  uint64 version = 3;
+  uint32 replication_factor = 4;
+  uint32 write_quorum = 5;
+  repeated ChunkPlacement chunks = 6; // fixos para este upload_id; novo destino requer outra tentativa
+  int64 lease_expires_at_unix_ms = 7;
+}
+
+// O lease nao e renovado implicitamente pelo trafego no StorageService.
+// Um upload longo deve renovar periodicamente junto ao MetadataService.
+message RenewLeaseRequest { string upload_id = 1; }
+message RenewLeaseResponse { int64 lease_expires_at_unix_ms = 1; }
+
+message CommitUploadRequest {
+  string upload_id = 1;
+  repeated BlockReceipt receipts = 2;
+}
+message AbortUploadRequest { string upload_id = 1; }
+message ResolveDownloadRequest { string path = 1; }
+message ResolveDownloadResponse {
+  FileMetadata file = 1;
+  repeated ChunkLocation chunks = 2;
+}
+message DeleteRequest {
+  string path = 1;
+  optional uint64 expected_version = 2;
+}
+message ListDirRequest {
+  string path = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+message DirectoryEntry {
+  string path = 1;
+  bool is_directory = 2;
+  uint64 size_bytes = 3;
+}
+message ListDirResponse {
+  repeated DirectoryEntry entries = 1;
+  string next_page_token = 2;
+}
+message StatRequest { string path = 1; }
+message StatResponse {
+  bool is_directory = 1;
+  FileMetadata file = 2; // ausente para diretorio
+  repeated ChunkLocation chunks = 3; // inclui localizacao das replicas
+}
+message RenameRequest {
+  string source_path = 1;
+  string target_path = 2;
+  bool overwrite = 3;
+}
+message MkdirRequest { string path = 1; }
+message RmdirRequest {
+  string path = 1;
+  bool recursive = 2;
+}
+
+// PESSOA 2: dados reais, streaming, escrita atomica, integridade e copia.
+service StorageService {
+  rpc StoreBlock(stream StoreBlockFrame) returns (BlockReceipt);
+  rpc GetBlock(GetBlockRequest) returns (stream GetBlockFrame);
+  rpc DeleteBlock(DeleteBlockRequest) returns (google.protobuf.Empty);
+  rpc CopyBlock(CopyBlockRequest) returns (BlockReceipt);
+}
+message StoreBlockHeader {
+  string block_id = 1;
+  string upload_id = 2;          // vazio apenas para copia autorizada
+  uint64 version = 3;
+  uint64 expected_size_bytes = 4;
+  bytes expected_storage_sha256 = 5;
+}
+message StoreBlockFrame {
+  oneof payload {
+    StoreBlockHeader header = 1; // primeira mensagem, exatamente uma vez
+    bytes data = 2;             // frames subsequentes: sugestao 256 KiB
+  }
+}
+message GetBlockRequest { string block_id = 1; }
+message GetBlockHeader {
+  string block_id = 1;
+  uint64 stored_size_bytes = 2;
+  bytes storage_sha256 = 3;
+}
+message GetBlockFrame {
+  oneof payload {
+    GetBlockHeader header = 1; // primeira mensagem
+    bytes data = 2;
+  }
+}
+message DeleteBlockRequest { string block_id = 1; }
+message CopyBlockRequest {
+  string block_id = 1;
+  NodeAddress destination = 2;
+  bytes expected_storage_sha256 = 3;
+  uint64 stored_size_bytes = 4;
+  uint64 version = 5;
+}
+
+// PESSOA 3: deteccao, registro, reconciliacao e recuperacao.
+// A Pessoa 5 oferece a interface de status e a operacao CLI de drain.
+service ControlService {
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (google.protobuf.Empty);
+  rpc ReportCorruption(ReportCorruptionRequest) returns (google.protobuf.Empty);
+  rpc Reconcile(stream InventoryBatch) returns (ReconcileResponse);
+  rpc GetStatus(google.protobuf.Empty) returns (GetStatusResponse);
+  rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse); // CLI: Pessoa 4; implementacao: Pessoa 3
+}
+message RegisterNodeRequest {
+  NodeAddress node = 1;
+  string boot_id = 2; // novo UUID a cada inicializacao do processo
+  uint64 total_bytes = 3;
+  uint64 used_bytes = 4;
+}
+message RegisterNodeResponse {
+  uint32 heartbeat_interval_seconds = 1;
+  uint32 suspect_timeout_seconds = 2;
+  uint32 dead_timeout_seconds = 3;
+}
+message HeartbeatRequest {
+  string node_id = 1;
+  string boot_id = 2;
+  uint64 total_bytes = 3;
+  uint64 used_bytes = 4;
+  uint64 available_bytes = 5;
+}
+message ReportCorruptionRequest {
+  string block_id = 1;
+  string suspected_node_id = 2;
+  bytes observed_sha256 = 3;
+  string reporter_id = 4; // no ou cliente que reportou
+}
+message StoredBlockInfo {
+  string block_id = 1;
+  uint64 version = 2;
+  uint64 stored_size_bytes = 3;
+  bytes storage_sha256 = 4;
+}
+message InventoryBatch {
+  string node_id = 1;
+  string boot_id = 2;
+  repeated StoredBlockInfo blocks = 3; // lotes pequenos (<4 MiB)
+}
+message ReconcileResponse {
+  repeated string obsolete_block_ids = 1; // para volumes grandes, paginar resposta
+}
+message NodeStatus {
+  NodeAddress node = 1;
+  NodeState state = 2;
+  uint64 total_bytes = 3;
+  uint64 used_bytes = 4;
+  uint64 available_bytes = 5;
+}
+message GetStatusResponse {
+  repeated NodeStatus nodes = 1;
+  uint64 healthy_files = 2;
+  uint64 under_replicated_files = 3;
+  uint64 recovering_files = 4;
+  uint64 unavailable_files = 5;
+  uint64 running_recovery_jobs = 6;
+}
+message DrainNodeRequest { string node_id = 1; }
+message DrainNodeResponse { string job_id = 1; }

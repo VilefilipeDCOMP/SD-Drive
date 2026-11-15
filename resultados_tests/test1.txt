@@ -1,0 +1,42 @@
+Atualmente tudo funciona normalmente
+console dos testes:
+================================================= test session starts =================================================
+platform win32 -- Python 3.11.9, pytest-9.2.0, pluggy-1.7.0 -- C:\Users\sidnei\AppData\Local\Programs\Python\Python311\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\sidnei\Documents\GitHub\SD-Drive
+plugins: asyncio-1.5.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 30 items
+
+tests/controller/test_node_registry.py::TestRegisterNode::test_register_novo_no PASSED                           [  3%]
+tests/controller/test_node_registry.py::TestRegisterNode::test_no_registrado_aparece_em_eligible PASSED          [  6%]
+tests/controller/test_node_registry.py::TestRegisterNode::test_re_registro_com_mesmo_boot_id_mantem_alive PASSED [ 10%]
+tests/controller/test_node_registry.py::TestRegisterNode::test_re_registro_com_novo_boot_id_reseta_para_alive PASSED [ 13%]
+tests/controller/test_node_registry.py::TestRegisterNode::test_multiplos_nos_registrados PASSED                  [ 16%]
+tests/controller/test_node_registry.py::TestHeartbeat::test_heartbeat_reconhecido PASSED                         [ 20%]
+tests/controller/test_node_registry.py::TestHeartbeat::test_heartbeat_boot_id_errado_retorna_false PASSED        [ 23%]
+tests/controller/test_node_registry.py::TestHeartbeat::test_heartbeat_no_desconhecido_retorna_false PASSED       [ 26%]
+tests/controller/test_node_registry.py::TestHeartbeat::test_heartbeat_atualiza_capacidade PASSED                 [ 30%]
+tests/controller/test_node_registry.py::TestHeartbeat::test_heartbeat_recupera_suspect_para_alive PASSED         [ 33%]
+tests/controller/test_node_registry.py::TestHeartbeat::test_heartbeat_nao_altera_draining PASSED                 [ 36%]
+tests/controller/test_node_registry.py::TestTimeout::test_suspect_apos_timeout PASSED                            [ 40%]
+tests/controller/test_node_registry.py::TestTimeout::test_dead_apos_timeout PASSED                               [ 43%]
+tests/controller/test_node_registry.py::TestTimeout::test_draining_nao_afetado_por_timeout PASSED                [ 46%]
+tests/controller/test_node_registry.py::TestTimeout::test_listener_notificado_em_suspect PASSED                  [ 50%]
+tests/controller/test_node_registry.py::TestEligibility::test_no_cheio_nao_elegivel PASSED                       [ 53%]
+tests/controller/test_node_registry.py::TestEligibility::test_no_suspect_nao_elegivel PASSED                     [ 56%]
+tests/controller/test_node_registry.py::TestEligibility::test_no_dead_nao_elegivel PASSED                        [ 60%]
+tests/controller/test_node_registry.py::TestEligibility::test_no_draining_nao_elegivel PASSED                    [ 63%]
+tests/controller/test_node_registry.py::TestDrain::test_set_draining PASSED                                      [ 66%]
+tests/controller/test_node_registry.py::TestDrain::test_set_draining_no_inexistente PASSED                       [ 70%]
+tests/controller/test_node_registry.py::TestDrain::test_drain_notifica_listener PASSED                           [ 73%]
+tests/controller/test_recovery.py::TestRecoveryManagerBasic::test_start_stop PASSED                              [ 76%]
+tests/controller/test_recovery.py::TestRecoveryManagerBasic::test_running_job_count_zero_sem_jobs PASSED         [ 80%]
+tests/controller/test_recovery.py::TestCorruptionReport::test_corruption_marca_replica_invalida PASSED           [ 83%]
+tests/controller/test_recovery.py::TestCorruptionReport::test_corruption_aciona_recovery PASSED                  [ 86%]
+tests/controller/test_recovery.py::TestDrainNode::test_drain_registra_job_e_retorna_id PASSED                    [ 90%]
+tests/controller/test_recovery.py::TestDrainNode::test_drain_no_sem_blocos_completa_rapidamente PASSED           [ 93%]
+tests/controller/test_recovery.py::TestScanAndRecover::test_sem_blocos_sub_replicados_nenhum_job PASSED          [ 96%]
+tests/controller/test_recovery.py::TestScanAndRecover::test_bloco_in_flight_nao_re_agendado PASSED               [100%]
+
+================================================= 30 passed in 3.99s ==================================================
