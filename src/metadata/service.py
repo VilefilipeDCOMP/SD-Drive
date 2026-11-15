@@ -600,17 +600,18 @@ class MetadataService(rpc.MetadataServiceServicer):
             connection = self._store.connection
             connection.execute("BEGIN IMMEDIATE")
             self._transaction_depth = 1
-            original = self._store.load()
-            if original is not None:
-                self._restore(original)
+            original = copy.deepcopy(self._snapshot())
             try:
+                stored = self._store.load()
+                if stored is not None:
+                    self._restore(stored)
+                    original = copy.deepcopy(self._snapshot())
                 yield
                 self._store.save(self._snapshot())
                 connection.commit()
             except BaseException:
                 connection.rollback()
-                if original is not None:
-                    self._restore(original)
+                self._restore(original)
                 raise
             finally:
                 self._transaction_depth = 0
