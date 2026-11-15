@@ -7,6 +7,9 @@ from pathlib import PurePosixPath
 from threading import RLock
 import time
 import copy
+import logging
+import json
+from datetime import datetime, timezone
 from typing import Callable
 from uuid import UUID, uuid4
 
@@ -80,7 +83,7 @@ class MetadataService(rpc.MetadataServiceServicer):
             context.abort(exc.code, str(exc))
 
     def allocate_upload(self, request: pb.AllocateUploadRequest) -> pb.AllocateUploadResponse:
-        with self._transaction():
+        with self._transaction("allocate_upload"):
             req = self._prepare_request(request)
             fingerprint = req.SerializeToString(deterministic=True)
             now_ms = int(self._clock() * 1000)
@@ -116,7 +119,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         req = pb.CommitUploadRequest()
         req.CopyFrom(request)
 
-        with self._transaction():
+        with self._transaction("commit_upload"):
             now_ms = int(self._clock() * 1000)
             self._release_expired_uploads(now_ms)
             pending, allocation = self._find_upload(req.upload_id)
@@ -232,7 +235,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def resolve_download(self, request: pb.ResolveDownloadRequest) -> pb.ResolveDownloadResponse:
         path = request.path
-        with self._transaction():
+        with self._transaction("resolve_download"):
             self._validate_path(path)
             stored = self._files.get(path)
             if stored is None:
@@ -530,7 +533,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def AbortUpload(self, request, context):
         try:
-            with self._transaction():
+            with self._transaction("AbortUpload"):
                 pending, allocation = self._find_upload(request.upload_id)
                 if request.upload_id in self._committed_receipts:
                     raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Upload já confirmado")
@@ -549,7 +552,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def RenewLease(self, request, context):
         try:
-            with self._transaction():
+            with self._transaction("RenewLease"):
                 pending, allocation = self._find_upload(request.upload_id)
                 now_ms = int(self._clock() * 1000)
                 if request.upload_id in self._aborted or request.upload_id in self._committed_receipts:
@@ -592,10 +595,15 @@ class MetadataService(rpc.MetadataServiceServicer):
             self._paths[path] = self._operations[operation_id]
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, operation="metadata"):
         with self._lock:
             if self._store is None or self._transaction_depth:
-                yield
+                try:
+                    yield
+                    self._log_event("metadata.operation_completed", operation=operation)
+                except Exception:
+                    self._log_event("metadata.operation_failed", operation=operation)
+                    raise
                 return
             connection = self._store.connection
             connection.execute("BEGIN IMMEDIATE")
@@ -609,8 +617,10 @@ class MetadataService(rpc.MetadataServiceServicer):
                 yield
                 self._store.save(self._snapshot())
                 connection.commit()
+                self._log_event("metadata.operation_completed", operation=operation)
             except BaseException:
                 connection.rollback()
+                self._log_event("metadata.operation_failed", operation=operation)
                 self._restore(original)
                 raise
             finally:
@@ -623,7 +633,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def Mkdir(self, request, context):
         try:
-            with self._transaction():
+            with self._transaction("Mkdir"):
                 if request.path in self._directories:
                     raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Diretório já existe")
                 self._validate_path(request.path)
@@ -639,7 +649,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def Stat(self, request, context):
         try:
-            with self._transaction():
+            with self._transaction("Stat"):
                 if request.path in self._directories:
                     return pb.StatResponse(is_directory=True)
                 result = self.resolve_download(pb.ResolveDownloadRequest(path=request.path))
@@ -649,7 +659,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def ListDir(self, request, context):
         try:
-            with self._transaction():
+            with self._transaction("ListDir"):
                 if request.path != "/":
                     self._validate_path(request.path)
                 if request.path not in self._directories:
@@ -682,7 +692,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def Rename(self, request, context):
         try:
-            with self._transaction():
+            with self._transaction("Rename"):
                 source = request.source_path
                 target = request.target_path
                 self._validate_path(source)
@@ -722,7 +732,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def Delete(self, request, context):
         try:
-            with self._transaction():
+            with self._transaction("Delete"):
                 self._validate_path(request.path)
                 self._release_expired_uploads(int(self._clock() * 1000))
                 if request.path in self._paths:
@@ -742,7 +752,7 @@ class MetadataService(rpc.MetadataServiceServicer):
 
     def Rmdir(self, request, context):
         try:
-            with self._transaction():
+            with self._transaction("Rmdir"):
                 if request.path == "/":
                     raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Não é permitido remover a raiz")
                 self._validate_path(request.path)
@@ -796,7 +806,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         return records
 
     def list_blocks_on_node(self, node_id):
-        with self._transaction():
+        with self._transaction("list_blocks_on_node"):
             result = []
             for record in self._block_records():
                 for replica in record["replicas"]:
@@ -806,14 +816,14 @@ class MetadataService(rpc.MetadataServiceServicer):
             return result
 
     def list_healthy_sources(self, block_id):
-        with self._transaction():
+        with self._transaction("list_healthy_sources"):
             for record in self._block_records():
                 if record["block_id"] == block_id:
                     return [replica.node for replica in record["replicas"] if replica.healthy]
             return []
 
     def list_under_replicated_blocks(self):
-        with self._transaction():
+        with self._transaction("list_under_replicated_blocks"):
             result = []
             for record in self._block_records():
                 count = 0
@@ -827,7 +837,7 @@ class MetadataService(rpc.MetadataServiceServicer):
             return result
 
     def select_destination(self, block_id, excluded_node_ids):
-        with self._transaction():
+        with self._transaction("select_destination"):
             for record in self._block_records():
                 if record["block_id"] != block_id:
                     continue
@@ -846,7 +856,7 @@ class MetadataService(rpc.MetadataServiceServicer):
             raise AllocationError(grpc.StatusCode.NOT_FOUND, "Bloco não encontrado")
 
     def mark_replica_invalid(self, block_id, node_id):
-        with self._transaction():
+        with self._transaction("mark_replica_invalid"):
             for record in self._block_records():
                 if record["block_id"] == block_id:
                     for replica in record["replicas"]:
@@ -856,7 +866,7 @@ class MetadataService(rpc.MetadataServiceServicer):
             raise AllocationError(grpc.StatusCode.NOT_FOUND, "Réplica não encontrada")
 
     def register_recovered_replica(self, block_id, receipt):
-        with self._transaction():
+        with self._transaction("register_recovered_replica"):
             for stored in self._files.values():
                 metadata = pb.FileMetadata.FromString(stored)
                 if metadata.state != pb.FILE_COMMITTED:
@@ -891,7 +901,7 @@ class MetadataService(rpc.MetadataServiceServicer):
             raise AllocationError(grpc.StatusCode.NOT_FOUND, "Bloco não encontrado")
 
     def gc_candidates(self):
-        with self._transaction():
+        with self._transaction("gc_candidates"):
             self._release_expired_uploads(int(self._clock() * 1000))
             protected = set()
             for record in self._block_records():
@@ -911,3 +921,8 @@ class MetadataService(rpc.MetadataServiceServicer):
                         key = f"{chunk.block_id}:{node.node_id}"
                         candidates[key] = {"block_id": chunk.block_id, "node": node, "stored_size_bytes": chunk.stored_size_bytes, "version": allocation.version}
             return list(candidates.values())
+
+    def _log_event(self, event, **fields):
+        record = {"ts": datetime.now(timezone.utc).isoformat(), "component": "metadata", "event": event}
+        record.update(fields)
+        logging.getLogger("dcomp_drive.metadata").info(json.dumps(record, ensure_ascii=False))
