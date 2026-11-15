@@ -63,3 +63,17 @@ def test_gc_includes_expired_and_cancelled_partial_uploads():
     now[0] += 10
     assert len(service.gc_candidates()) == 3
     assert not service._reserved
+
+def test_confirmed_gc_releases_capacity_once_and_rejects_active_blocks():
+    import pytest
+    from metadata.service import AllocationError
+    service, request, allocation, _ = prepare_upload()
+    service.commit_upload(commit_request(request, allocation))
+    with pytest.raises(AllocationError):
+        service.acknowledge_gc(request.chunks[0].block_id, allocation.chunks[0].targets[0].node_id)
+    service.Delete(pb.DeleteRequest(path=request.path), Context())
+    for candidate in service.gc_candidates():
+        service.acknowledge_gc(candidate["block_id"], candidate["node"].node_id)
+        service.acknowledge_gc(candidate["block_id"], candidate["node"].node_id)
+    assert service.gc_candidates() == []
+    assert not service._reserved

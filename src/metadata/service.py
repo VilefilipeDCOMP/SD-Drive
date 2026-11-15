@@ -69,6 +69,8 @@ class MetadataService(rpc.MetadataServiceServicer):
         self._directories = {"/"}
         self._invalid_replicas = set()
         self._original_receipts = {}
+        self._block_reservations = {}
+        self._gc_confirmed = set()
         self._store = MetadataStore(db_path) if db_path is not None else None
         self._transaction_depth = 0
         if self._store is not None:
@@ -424,6 +426,11 @@ class MetadataService(rpc.MetadataServiceServicer):
             if total > previous_total:
                 upload_reservations[node_id] = total - previous_total
 
+        for chunk, placement in zip(req.chunks, response.chunks):
+            self._block_reservations[chunk.block_id] = {}
+            for node in placement.targets:
+                self._block_reservations[chunk.block_id][node.node_id] = chunk.stored_size_bytes
+
         self._reserved = reservations
         self._upload_reservations[req.operation_id] = upload_reservations
         self._operations[req.operation_id] = pending
@@ -440,6 +447,9 @@ class MetadataService(rpc.MetadataServiceServicer):
             if pending.expires_at_ms > now_ms:
                 continue
 
+            manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
+            for chunk in manifest.chunks:
+                self._block_reservations.pop(chunk.block_id, None)
             reservations = self._upload_reservations.pop(operation_id)
             for node_id, size in reservations.items():
                 self._reserved[node_id] -= size
@@ -539,6 +549,8 @@ class MetadataService(rpc.MetadataServiceServicer):
                     raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Upload já confirmado")
                 self._aborted.add(request.upload_id)
                 manifest = pb.AllocateUploadRequest.FromString(pending.fingerprint)
+                for chunk in manifest.chunks:
+                    self._block_reservations.pop(chunk.block_id, None)
                 reservations = self._upload_reservations.pop(manifest.operation_id, {})
                 for node_id, size in reservations.items():
                     self._reserved[node_id] -= size
@@ -569,7 +581,7 @@ class MetadataService(rpc.MetadataServiceServicer):
         except AllocationError as exc:
             context.abort(exc.code, str(exc))
 
-    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started", "_directories", "_invalid_replicas", "_original_receipts")
+    _state_fields = ("_reserved", "_upload_reservations", "_block_ids", "_files", "_committed_receipts", "_upload_results", "_aborted", "_upload_started", "_directories", "_invalid_replicas", "_original_receipts", "_block_reservations", "_gc_confirmed")
 
     def _snapshot(self):
         state = {}
@@ -919,6 +931,8 @@ class MetadataService(rpc.MetadataServiceServicer):
                         continue
                     for node in placement.targets:
                         key = f"{chunk.block_id}:{node.node_id}"
+                        if key in self._gc_confirmed:
+                            continue
                         candidates[key] = {"block_id": chunk.block_id, "node": node, "stored_size_bytes": chunk.stored_size_bytes, "version": allocation.version}
             return list(candidates.values())
 
@@ -926,3 +940,21 @@ class MetadataService(rpc.MetadataServiceServicer):
         record = {"ts": datetime.now(timezone.utc).isoformat(), "component": "metadata", "event": event}
         record.update(fields)
         logging.getLogger("dcomp_drive.metadata").info(json.dumps(record, ensure_ascii=False))
+
+    def acknowledge_gc(self, block_id, node_id):
+        """O controlador chama somente após DeleteBlock concluir com sucesso."""
+        with self._transaction("acknowledge_gc"):
+            key = f"{block_id}:{node_id}"
+            if key in self._gc_confirmed:
+                return
+            for candidate in self.gc_candidates():
+                if candidate["block_id"] == block_id and candidate["node"].node_id == node_id:
+                    reservations = self._block_reservations.get(block_id, {})
+                    size = reservations.pop(node_id, 0)
+                    if size:
+                        self._reserved[node_id] -= size
+                        if self._reserved[node_id] == 0:
+                            del self._reserved[node_id]
+                    self._gc_confirmed.add(key)
+                    return
+            raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Bloco ainda referenciado ou sem ordem de limpeza")
