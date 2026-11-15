@@ -947,7 +947,7 @@ class MetadataService(rpc.MetadataServiceServicer):
             return list(candidates.values())
 
     def _log_event(self, event, **fields):
-        record = {"ts": datetime.now(timezone.utc).isoformat(), "component": "metadata", "event": event}
+        record = {"ts": datetime.now(timezone.utc).isoformat(), "component": "metadata", "event": event, "level": "INFO"}
         record.update(fields)
         logging.getLogger("dcomp_drive.metadata").info(json.dumps(record, ensure_ascii=False))
 
