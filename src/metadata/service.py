@@ -655,6 +655,7 @@ class MetadataService(rpc.MetadataServiceServicer):
                 if request.path in self._directories:
                     raise AllocationError(grpc.StatusCode.ALREADY_EXISTS, "Diretório já existe")
                 self._validate_path(request.path)
+                self._release_expired_uploads(int(self._clock() * 1000))
                 if request.path in self._paths:
                     raise AllocationError(grpc.StatusCode.ABORTED, "Caminho reservado por upload")
                 stored = self._files.get(request.path)

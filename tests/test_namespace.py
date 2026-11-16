@@ -17,6 +17,21 @@ def test_mkdir_enables_nested_upload_and_rejects_missing_parent():
         service.Mkdir(pb.MkdirRequest(path="/ausente/filha"), Context())
     assert exc.value.code == grpc.StatusCode.NOT_FOUND
 
+def test_mkdir_releases_expired_upload_but_preserves_active_lease():
+    service, request, allocation, now = prepare_upload()
+    query = pb.MkdirRequest(path=request.path)
+    with pytest.raises(AllocationError) as exc:
+        service.Mkdir(query, Context())
+    assert exc.value.code == grpc.StatusCode.ABORTED
+
+    now[0] = allocation.lease_expires_at_unix_ms / 1000
+    service.Mkdir(query, Context())
+    assert service.Stat(pb.StatRequest(path=request.path), Context()).is_directory
+    assert not service._reserved
+    with pytest.raises(AllocationError) as exc:
+        service.commit_upload(commit_request(request, allocation))
+    assert exc.value.code == grpc.StatusCode.ABORTED
+
 def test_stat_reads_file_and_root_without_exposing_pending():
     service, request, allocation, _ = prepare_upload()
     assert service.Stat(pb.StatRequest(path="/"), Context()).is_directory
