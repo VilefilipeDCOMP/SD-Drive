@@ -1,0 +1,7 @@
+# Shell scripts need LF inside Linux containers, even after checkout on Windows.
+*.sh text eol=lf
+*.py text eol=lf
+*.proto text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.pdf binary
