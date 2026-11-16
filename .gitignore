@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Projeto
+/src/dcomp_drive_pb2.py
+/src/dcomp_drive_pb2_grpc.py
+/src/dcomp_drive_pb2.pyi
