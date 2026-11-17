@@ -15,6 +15,13 @@ from client.chunker import (
 )
 from client.storage_client import StorageClient, StorageStreamError
 from client.controller_client import ControllerClient, format_rpc_error
+from client.service import (
+    ClientService,
+    ClientServiceError,
+    InsufficientNodesError,
+    QuorumError,
+    UploadError,
+)
 
 __all__ = [
     "ClientConfig",
@@ -33,4 +40,9 @@ __all__ = [
     "StorageStreamError",
     "ControllerClient",
     "format_rpc_error",
+    "ClientService",
+    "ClientServiceError",
+    "UploadError",
+    "QuorumError",
+    "InsufficientNodesError",
 ]

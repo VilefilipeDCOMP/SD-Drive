@@ -37,6 +37,7 @@ class PreparedUpload:
         return [c.manifest for c in self.chunks]
 
     def regenerate_attempt(self) -> None:
+        #Regenera novos block_ids para uma nova tentativa de upload após falha.
         new_chunks: List[PreparedChunk] = []
         for c in self.chunks:
             new_block_id = str(uuid4())
@@ -166,4 +167,3 @@ def prepare_file_upload(
 
     prepared.chunks = chunks
     return prepared
-

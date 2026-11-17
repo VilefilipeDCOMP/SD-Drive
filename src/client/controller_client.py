@@ -47,7 +47,7 @@ def format_rpc_error(exc: grpc.RpcError) -> str:
 
 
 class ControllerClient:
-    # Cliente gRPC que interage com o processo central
+    #Cliente gRPC que interage com o processo central
 
     def __init__(
         self,
@@ -85,6 +85,7 @@ class ControllerClient:
             except Exception:
                 pass
 
+    #Solicita a alocação de upload e a reserva de destinos *PENDING*
     def allocate_upload(
         self,
         path: str,
@@ -98,7 +99,6 @@ class ControllerClient:
         excluded_node_ids: Optional[List[str]] = None,
         timeout: Optional[float] = None,
     ) -> pb.AllocateUploadResponse:
-        #Solicita a alocação de upload e a reserva de destinos
         req = pb.AllocateUploadRequest(
             path,
             operation_id,
@@ -114,6 +114,7 @@ class ControllerClient:
             req, timeout=timeout or self.default_timeout
         )
 
+    #Renova o lease de um upload PENDING antes que expire
     def renew_lease(
         self, upload_id: str, timeout: Optional[float] = None
     ) -> pb.RenewLeaseResponse:
@@ -122,6 +123,7 @@ class ControllerClient:
             req, timeout=timeout or self.default_timeout
         )
 
+    #Publica o arquivo como COMMITTED após satisfazer o quórum W
     def commit_upload(
         self,
         upload_id: str,
@@ -133,12 +135,14 @@ class ControllerClient:
             req, timeout=timeout or self.default_timeout
         )
 
+    #Invalida a tentativa de upload e libera locks/recursos de lease
     def abort_upload(
         self, upload_id: str, timeout: Optional[float] = None
     ) -> None:
         req = pb.AbortUploadRequest(upload_id)
         self.metadata_stub.AbortUpload(req, timeout=timeout or self.default_timeout)
 
+    #Obtém a lista de chunks e nós réplicas para leitura de versão
     def resolve_download(
         self, path: str, timeout: Optional[float] = None
     ) -> pb.ResolveDownloadResponse:
@@ -147,6 +151,7 @@ class ControllerClient:
             req, timeout=timeout or self.default_timeout
         )
 
+    #Marca o caminho como DELETED logicamente
     def delete(
         self,
         path: str,
@@ -156,6 +161,7 @@ class ControllerClient:
         req = pb.DeleteRequest(path, expected_version)
         self.metadata_stub.Delete(req, timeout=timeout or self.default_timeout)
 
+    #Renomeia ou move um arquivo/diretório de modo atômico
     def rename(
         self,
         source_path: str,
@@ -168,6 +174,7 @@ class ControllerClient:
         )
         self.metadata_stub.Rename(req, timeout=timeout or self.default_timeout)
 
+    #Lista entradas visíveis de arquivos e diretórios
     def list_dir(
         self,
         path: str,
@@ -180,22 +187,25 @@ class ControllerClient:
         )
         return self.metadata_stub.ListDir(req, timeout=timeout or self.default_timeout)
 
+    #Consulta metadados de arquivo ou diretório
     def stat(self, path: str, timeout: Optional[float] = None) -> pb.StatResponse:
         req = pb.StatRequest(path)
         return self.metadata_stub.Stat(req, timeout=timeout or self.default_timeout)
 
+    #Cria um novo diretório no namespace
     def mkdir(self, path: str, timeout: Optional[float] = None) -> None:
         req = pb.MkdirRequest(path)
         self.metadata_stub.Mkdir(req, timeout=timeout or self.default_timeout)
-
+    
+    #Remove um diretório (opcionalmente recursivo)
     def rmdir(
         self, path: str, recursive: bool = False, timeout: Optional[float] = None
-    ) -> None:
+    ) -> None:    
         req = pb.RmdirRequest(path, recursive)
         self.metadata_stub.Rmdir(req, timeout=timeout or self.default_timeout)
 
     # Métodos do ControlService
-    #Solicita o esvaziamento (drain) de um nó de armazenamento.
+    #Solicita o esvaziamento (drain) de um nó de armazenamento
     def drain_node(
         self, node_id: str, timeout: Optional[float] = None
     ) -> pb.DrainNodeResponse:
@@ -204,15 +214,15 @@ class ControllerClient:
             req, timeout=timeout or self.default_timeout
         )
 
-    #Consulta o status geral do cluster (nós, capacidade e saúde dos arquivos).
+    #Consulta o status geral do cluster (nós, capacidade e saúde dos arquivos)
     def get_status(
         self, timeout: Optional[float] = None
     ) -> pb.GetStatusResponse:
         return self.control_stub.GetStatus(
             empty_pb2.Empty(), timeout=timeout or self.default_timeout
         )
-
-    #Notifica o controlador sobre bloco com corrupção detectada para agendar recuperação.
+    
+    #Notifica o controlador sobre bloco com corrupção detectada para agendar recuperação
     def report_corruption(
         self,
         block_id: str,
