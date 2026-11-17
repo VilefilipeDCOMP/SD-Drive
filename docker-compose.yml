@@ -1,0 +1,152 @@
+# ambiente com 1 central + 5 nos de armazenamento, todos com processos provisorios por enquanto.
+# quando o codigo real de cada pessoa ficar pronto, troque so o command (placeholder -> central/storage).
+#
+# uso:
+#   docker compose up -d --build
+#   docker compose ps
+#   docker compose logs -f
+#   docker compose run --rm cli <comando>      (a cli roda dentro da rede, entao storage-N resolve)
+#   docker compose --profile extra up -d storage-6   (descoberta de no novo, sem reiniciar nada)
+#
+# cada no tem machine_id e disk_id proprios. para simular dois discos na mesma maquina, de ao
+# dois servicos o mesmo machine_id e disk_ids diferentes.
+
+x-common-env: &common-env
+  DCOMP_CONFIG: /app/config.yaml
+  DCOMP_OBSERVABILITY__METRICS_PORT: "9100"
+
+x-storage: &storage
+  image: dcomp-drive:dev
+  build: .
+  command: ["python", "-m", "placeholder", "storage"]
+  restart: "no"          # no derrubado de proposito precisa continuar fora do ar para a deteccao aparecer
+  networks: [dcomp]
+  depends_on:
+    central:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "python", "-m", "placeholder", "healthcheck", "localhost:50052"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+x-storage-env: &storage-env
+  <<: *common-env
+  DCOMP_STORAGE__CENTRAL_TARGET: central:50051
+  # capacidade logica de 2 GiB por no; os volumes docker dividem o disco do host
+  DCOMP_STORAGE__CAPACITY_BYTES: "2147483648"
+
+services:
+  central:
+    image: dcomp-drive:dev
+    build: .
+    command: ["python", "-m", "placeholder", "central"]
+    restart: unless-stopped
+    networks: [dcomp]
+    environment:
+      <<: *common-env
+    volumes:
+      - central-data:/data
+    ports:
+      - "50051:50051"
+    healthcheck:
+      test: ["CMD", "python", "-m", "placeholder", "healthcheck", "localhost:50051"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  storage-1:
+    <<: *storage
+    hostname: storage-1
+    environment:
+      <<: *storage-env
+      DCOMP_STORAGE__ADVERTISE_ADDR: storage-1:50052
+      DCOMP_STORAGE__MACHINE_ID: machine-1
+      DCOMP_STORAGE__DISK_ID: disk-1
+    volumes:
+      - storage-1-data:/data
+
+  storage-2:
+    <<: *storage
+    hostname: storage-2
+    environment:
+      <<: *storage-env
+      DCOMP_STORAGE__ADVERTISE_ADDR: storage-2:50052
+      DCOMP_STORAGE__MACHINE_ID: machine-2
+      DCOMP_STORAGE__DISK_ID: disk-2
+    volumes:
+      - storage-2-data:/data
+
+  storage-3:
+    <<: *storage
+    hostname: storage-3
+    environment:
+      <<: *storage-env
+      DCOMP_STORAGE__ADVERTISE_ADDR: storage-3:50052
+      DCOMP_STORAGE__MACHINE_ID: machine-3
+      DCOMP_STORAGE__DISK_ID: disk-3
+    volumes:
+      - storage-3-data:/data
+
+  storage-4:
+    <<: *storage
+    hostname: storage-4
+    environment:
+      <<: *storage-env
+      DCOMP_STORAGE__ADVERTISE_ADDR: storage-4:50052
+      DCOMP_STORAGE__MACHINE_ID: machine-4
+      DCOMP_STORAGE__DISK_ID: disk-4
+    volumes:
+      - storage-4-data:/data
+
+  storage-5:
+    <<: *storage
+    hostname: storage-5
+    environment:
+      <<: *storage-env
+      DCOMP_STORAGE__ADVERTISE_ADDR: storage-5:50052
+      DCOMP_STORAGE__MACHINE_ID: machine-5
+      DCOMP_STORAGE__DISK_ID: disk-5
+    volumes:
+      - storage-5-data:/data
+
+  # sexto no so sobe com --profile extra; serve para mostrar a descoberta automatica (rf6)
+  storage-6:
+    <<: *storage
+    hostname: storage-6
+    profiles: ["extra"]
+    environment:
+      <<: *storage-env
+      DCOMP_STORAGE__ADVERTISE_ADDR: storage-6:50052
+      DCOMP_STORAGE__MACHINE_ID: machine-6
+      DCOMP_STORAGE__DISK_ID: disk-6
+    volumes:
+      - storage-6-data:/data
+
+  # cli sob demanda; a chave aes (se usada) deve ser montada aqui como secret e nunca entrar no git
+  cli:
+    image: dcomp-drive:dev
+    build: .
+    profiles: ["tools"]
+    entrypoint: ["python", "-m", "placeholder"]
+    networks: [dcomp]
+    environment:
+      <<: *common-env
+      DCOMP_CLIENT__CENTRAL_TARGET: central:50051
+    volumes:
+      - ./workspace:/work
+    working_dir: /work
+
+networks:
+  dcomp:
+    name: dcomp_net
+
+volumes:
+  central-data:
+  storage-1-data:
+  storage-2-data:
+  storage-3-data:
+  storage-4-data:
+  storage-5-data:
+  storage-6-data:
+

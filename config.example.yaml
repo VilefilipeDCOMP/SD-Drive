@@ -1,0 +1,50 @@
+# Valores de referencia adotados para a Parte 1; N, W e outros parametros configuraveis.
+# precedencia: argumentos de linha de comando > variaveis DCOMP_<SECAO>__<CHAVE> > este arquivo > defaults do codigo.
+# exemplo: DCOMP_CLUSTER__REPLICATION_FACTOR=2 sobrescreve cluster.replication_factor.
+# chaves desconhecidas sao rejeitadas na inicializacao para pegar erros de digitacao cedo.
+cluster:
+  replication_factor: 3
+  write_quorum: "all"  # W=N; tambem aceita inteiro 1..N (valor invalido rejeitado)
+  reject_when_insufficient_distinct_nodes: true
+  max_disk_usage_fraction: 0.90
+controller:
+  grpc_bind: "0.0.0.0:50051"
+  metadata_db_path: "/data/metadata.db"
+  heartbeat_interval_seconds: 3
+  suspect_timeout_seconds: 10
+  dead_timeout_seconds: 30
+  max_concurrent_recoveries: 2
+  upload_lease_seconds: 900        # 15 min; renovavel enquanto upload PENDING
+  upload_max_lifetime_seconds: 14400  # 4 h por tentativa; impede lease eterno
+  placement_eligible_node_states: ["ALIVE"]  # SUSPECT/DEAD/DRAINING inelegiveis
+storage:
+  grpc_bind: "0.0.0.0:50052"
+  central_target: "controller:50051"  # endereco do processo central visto pelo no
+  advertise_addr: ""                  # endereco que CLI e outros nos usam; vazio = <hostname>:<porta do grpc_bind>
+  machine_id: ""                      # dominio de falha da maquina; vazio = hostname
+  disk_id: ""                         # identificador do disco/volume; vazio = <machine_id>-disk0
+  node_id_file: "/data/node_id"       # node_id estavel, gerado na primeira execucao e guardado no volume
+  block_directory: "/data/blocks"
+  # capacidade logica do no (0 = so o espaco fisico). os volumes docker dividem o disco do host,
+  # entao o no deve reportar min(logica - usado pelos blocos, livre fisico) e respeitar os dois limites.
+  capacity_bytes: 0
+  scrub_interval_seconds: 60
+client:
+  central_target: "controller:50051"  # adaptado se CLI rodar fora do Compose
+  logical_chunk_size_bytes: 4194304   # 4 MiB
+  grpc_frame_size_bytes: 262144       # 256 KiB por mensagem
+  lease_renew_interval_seconds: 180   # antes do vencimento; nao em cada frame
+  upload_rpc_deadline_seconds: 45     # configuravel por ambiente
+  upload_retry_max_attempts: 3       # total de tentativas, contando a primeira; novo operation_id apos abort
+  upload_retry_backoff_initial_seconds: 1.0  # intervalo inicial entre tentativas
+  upload_retry_backoff_max_seconds: 4.0      # teto de backoff exponencial
+  upload_retry_backoff_jitter_fraction: 0.2 # varia o intervalo em +/-20%
+  encryption_enabled: false          # obrigatoriamente suportar true/false
+  encryption_algorithm: "AES-256-GCM"
+  # Chave criptografica nunca entra neste arquivo/repo; fornecer no cliente por segredo.
+observability:
+  metrics_port: 9100                 # 0 desliga o endpoint /metrics
+  log_format: "json"                 # "json" (padrao, RF12) ou "console" (legivel para desenvolvimento)
+  log_level: "INFO"
+  log_file: ""                       # vazio = somente stdout; aceita {instance}, ex: /logs/{instance}.jsonl
+  strict_events: false               # true faz eventos fora do catalogo gerarem erro (util em testes)
