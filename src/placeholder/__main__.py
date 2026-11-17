@@ -27,6 +27,7 @@ import grpc
 
 from common.config import ConfigError, add_config_arguments, load_from_args
 from common.logging import configure_logging, configure_from_config, get_logger
+from common.metrics import Metrics, MetricsInterceptor, start_metrics_server
 
 
 def _healthcheck(target: str) -> int:
@@ -78,11 +79,13 @@ def _serve(role: str, args: argparse.Namespace) -> int:
             advertise_addr=cfg.storage.resolve_advertise_addr(hostname),
         )
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    metrics = Metrics()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2), interceptors=[MetricsInterceptor(metrics, role)])
     if server.add_insecure_port(bind) == 0:
         log.error("service.started", msg=f"nao foi possivel abrir {bind}", **context)
         return 1
     server.start()
+    start_metrics_server(cfg.observability.metrics_port, metrics)
     log.info("service.started", msg="processo provisorio, sem servicos grpc reais", **context)
 
     stop = threading.Event()
