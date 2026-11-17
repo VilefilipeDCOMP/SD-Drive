@@ -42,7 +42,7 @@ def load_client_config(config_path: str | Path | None = None) -> ClientConfig:
     if config_path:
         search_paths.append(Path(config_path))
     else:
-        # Tenta localizar config.yaml ou config.example.yaml nas raizes comuns
+        # Tenta localizar config.yaml ou config.example.yaml
         cwd = Path.cwd()
         search_paths.extend([
             cwd / "config.yaml",
@@ -95,7 +95,6 @@ def load_client_config(config_path: str | Path | None = None) -> ClientConfig:
         if "client_events_path" in obs_sec:
             cfg.client_events_path = str(obs_sec["client_events_path"])
 
-    # Sobrescrita por variáveis de ambiente
     env_central = os.getenv("DCOMP_CONTROLLER_TARGET") or os.getenv("DCOMP_CENTRAL_TARGET")
     if env_central:
         cfg.central_target = env_central.strip()

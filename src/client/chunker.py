@@ -37,10 +37,6 @@ class PreparedUpload:
         return [c.manifest for c in self.chunks]
 
     def regenerate_attempt(self) -> None:
-        """
-        Regenera novos block_ids (e novos nonces se criptografado) para uma nova
-        tentativa de upload após falha, conforme exigido pelo contrato.
-        """
         new_chunks: List[PreparedChunk] = []
         for c in self.chunks:
             new_block_id = str(uuid4())
@@ -54,22 +50,22 @@ class PreparedUpload:
             storage_sha256 = hashlib.sha256(stored_bytes).digest()
             stored_size_bytes = len(stored_bytes)
             manifest = pb.ChunkManifest(
-                block_id=new_block_id,
-                index=c.index,
-                stored_size_bytes=stored_size_bytes,
-                storage_sha256=storage_sha256,
-                nonce=new_nonce,
+                new_block_id,
+                c.index,
+                stored_size_bytes,
+                storage_sha256,
+                new_nonce,
             )
             new_chunks.append(
                 PreparedChunk(
-                    index=c.index,
-                    block_id=new_block_id,
-                    raw_bytes=c.raw_bytes,
-                    stored_bytes=stored_bytes,
-                    nonce=new_nonce,
-                    stored_size_bytes=stored_size_bytes,
-                    storage_sha256=storage_sha256,
-                    manifest=manifest,
+                    c.index,
+                    new_block_id,
+                    c.raw_bytes,
+                    stored_bytes,
+                    new_nonce,
+                    stored_size_bytes,
+                    storage_sha256,
+                    manifest,
                 )
             )
         self.chunks = new_chunks
@@ -114,15 +110,15 @@ def prepare_file_upload(
     plaintext_sha256 = hasher.digest()
 
     prepared = PreparedUpload(
-        local_path=local,
-        remote_path=remote_path,
-        plaintext_size_bytes=file_size,
-        plaintext_sha256=plaintext_sha256,
-        encryption_mode=encryption_mode,
-        key=key,
+        local,
+        remote_path,
+        file_size,
+        plaintext_sha256,
+        encryption_mode,
+        key,
     )
 
-    # Se o arquivo for vazio (0 bytes), não cria blocos (chunk_count = 0)
+    # Se o arquivo for vazio, não cria blocos
     if file_size == 0:
         return prepared
 
@@ -147,23 +143,23 @@ def prepare_file_upload(
             stored_size_bytes = len(stored_bytes)
 
             manifest = pb.ChunkManifest(
-                block_id=block_id,
-                index=index,
-                stored_size_bytes=stored_size_bytes,
-                storage_sha256=storage_sha256,
-                nonce=nonce,
+                block_id,
+                index,
+                stored_size_bytes,
+                storage_sha256,
+                nonce,
             )
 
             chunks.append(
                 PreparedChunk(
-                    index=index,
-                    block_id=block_id,
-                    raw_bytes=raw_bytes,
-                    stored_bytes=stored_bytes,
-                    nonce=nonce,
-                    stored_size_bytes=stored_size_bytes,
-                    storage_sha256=storage_sha256,
-                    manifest=manifest,
+                    index,
+                    block_id,
+                    raw_bytes,
+                    stored_bytes,
+                    nonce,
+                    stored_size_bytes,
+                    storage_sha256,
+                    manifest,
                 )
             )
             index += 1
