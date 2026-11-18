@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
+
+_SRC_DIR = str(Path(__file__).resolve().parent.parent)
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
 
 import dcomp_drive_pb2 as pb
 from client.crypto import encrypt_chunk, generate_nonce

@@ -35,13 +35,16 @@ def _parse_bool(value: Any) -> bool:
 
 
 def load_client_config(config_path: str | Path | None = None) -> ClientConfig:
-    """Carrega as configurações do cliente a partir de um arquivo YAML e sobrescreve por variáveis de ambiente."""
+    #Carrega as configurações do cliente a partir de um arquivo YAML e sobrescreve por variáveis de ambiente
     cfg = ClientConfig()
 
     search_paths = []
     if config_path:
         search_paths.append(Path(config_path))
     else:
+        env_cfg_path = os.getenv("DCOMP_CONFIG")
+        if env_cfg_path:
+            search_paths.append(Path(env_cfg_path))
         # Tenta localizar config.yaml ou config.example.yaml
         cwd = Path.cwd()
         search_paths.extend([
@@ -51,6 +54,7 @@ def load_client_config(config_path: str | Path | None = None) -> ClientConfig:
             cwd / "SD-Drive" / "config.example.yaml",
             cwd.parent / "config.yaml",
             cwd.parent / "config.example.yaml",
+            Path("/app/config.yaml"),
         ])
 
     data: dict[str, Any] = {}
@@ -92,18 +96,31 @@ def load_client_config(config_path: str | Path | None = None) -> ClientConfig:
 
     obs_sec = data.get("observability", {})
     if isinstance(obs_sec, dict):
-        if "client_events_path" in obs_sec:
+        if "client_events_path" in obs_sec and obs_sec["client_events_path"]:
             cfg.client_events_path = str(obs_sec["client_events_path"])
+        elif "log_file" in obs_sec and obs_sec["log_file"]:
+            cfg.client_events_path = str(obs_sec["log_file"]).replace("{instance}", "client")
 
-    env_central = os.getenv("DCOMP_CONTROLLER_TARGET") or os.getenv("DCOMP_CENTRAL_TARGET")
+    env_central = (
+        os.getenv("DCOMP_CLIENT__CENTRAL_TARGET")
+        or os.getenv("DCOMP_CONTROLLER_TARGET")
+        or os.getenv("DCOMP_CENTRAL_TARGET")
+    )
     if env_central:
         cfg.central_target = env_central.strip()
 
-    env_events = os.getenv("DCOMP_CLIENT_EVENTS_PATH")
+    env_events = (
+        os.getenv("DCOMP_CLIENT_EVENTS_PATH")
+        or os.getenv("DCOMP_OBSERVABILITY__LOG_FILE")
+    )
     if env_events:
-        cfg.client_events_path = env_events.strip()
+        cfg.client_events_path = env_events.strip().replace("{instance}", "client")
 
-    env_enc = os.getenv("DCOMP_ENCRYPTION_ENABLED")
+    env_enc = (
+        os.getenv("DCOMP_CLIENT__ENCRYPTION_ENABLED")
+        if os.getenv("DCOMP_CLIENT__ENCRYPTION_ENABLED") is not None
+        else os.getenv("DCOMP_ENCRYPTION_ENABLED")
+    )
     if env_enc is not None:
         cfg.encryption_enabled = _parse_bool(env_enc)
 

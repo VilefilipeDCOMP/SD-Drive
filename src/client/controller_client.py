@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import logging
+import sys
+from pathlib import Path
 from typing import List, Optional
+
+_SRC_DIR = str(Path(__file__).resolve().parent.parent)
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
 
 import grpc
 from google.protobuf import empty_pb2
