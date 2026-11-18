@@ -1,39 +1,13 @@
 from __future__ import annotations
 
-import logging
 import threading
 from dataclasses import dataclass
 from typing import Iterator
 
-from common.ports import MetadataPort
+from controller.logging_compat import get_logger
+from common.ports import MetadataPort, ReplicaReceipt
 
-try:
-    from common.logging import get_logger
-    logger = get_logger("central.control")
-except ImportError:
-    class _CompatLogger:
-        def __init__(self, name: str) -> None:
-            self._log = logging.getLogger(name)
-
-        def debug(self, event: str, **fields) -> None:
-            self._log.debug("%s %s", event, fields)
-
-        def info(self, event: str, **fields) -> None:
-            self._log.info("%s %s", event, fields)
-
-        def warning(self, event: str, **fields) -> None:
-            self._log.warning("%s %s", event, fields)
-
-        def error(self, event: str, **fields) -> None:
-            self._log.error("%s %s", event, fields)
-
-    logger = _CompatLogger("central.control")
-
-try:
-    import dcomp_drive_pb2 as pb
-    _PROTO_AVAILABLE = True
-except ImportError:
-    _PROTO_AVAILABLE = False
+logger = get_logger("controller.reconciliation")
 
 
 @dataclass
@@ -45,6 +19,7 @@ class InventoryItem:
 
 
 class ReconciliationService:
+
     def __init__(self, metadata_port: MetadataPort) -> None:
         self._meta = metadata_port
         self._lock = threading.Lock()
@@ -59,58 +34,92 @@ class ReconciliationService:
 
         for batch_node_id, batch_boot_id, items in inventory_batches:
             if batch_node_id != node_id or batch_boot_id != boot_id:
+                logger.warning(
+                    "Lote de reconciliação com IDs inconsistentes",
+                    extra={
+                        "event": "reconcile.batch_id_mismatch",
+                        "node_id": node_id,
+                        "batch_node_id": batch_node_id,
+                    },
+                )
                 continue
             all_blocks.extend(items)
 
+        logger.info(
+            "Reconciliando inventário do nó",
+            extra={
+                "event": "reconcile.started",
+                "node_id": node_id,
+                "boot_id": boot_id,
+                "total_blocks": len(all_blocks),
+            },
+        )
+
         obsolete_ids: list[str] = []
+        reused = 0
 
         try:
-            records = self._meta.list_blocks_on_node(node_id)
+            known_on_node = {
+                b.block_id: b
+                for b in self._meta.list_blocks_on_node(node_id)
+            }
         except Exception as exc:
             logger.error(
-                "log.record",
-                msg=f"falha ao consultar blocos do no na reconciliacao: {exc}",
-                node_id=node_id,
+                "Falha ao consultar blocos do nó nos metadados",
+                extra={
+                    "event": "reconcile.metadata_error",
+                    "node_id": node_id,
+                    "error": str(exc),
+                },
             )
             return []
 
-        known_on_node = {r["block_id"]: r for r in records}
+        inventory_set = {item.block_id for item in all_blocks}
 
         for item in all_blocks:
-            record = known_on_node.get(item.block_id)
-            if record is None:
+            known = known_on_node.get(item.block_id)
+            if known is None:
                 obsolete_ids.append(item.block_id)
                 continue
 
-            replica_healthy = True
-            for replica in record.get("replicas", []):
-                if replica.node.node_id == node_id:
-                    replica_healthy = replica.healthy
-                    break
-
-            if not replica_healthy and _PROTO_AVAILABLE:
-                manifest = record.get("manifest")
-                if (
-                    manifest is not None
-                    and item.stored_size_bytes == manifest.stored_size_bytes
-                    and item.storage_sha256 == manifest.storage_sha256
-                ):
-                    try:
-                        receipt = pb.BlockReceipt(
-                            block_id=item.block_id,
-                            node_id=node_id,
-                            stored_size_bytes=item.stored_size_bytes,
-                            verified_storage_sha256=item.storage_sha256,
-                        )
-                        self._meta.register_recovered_replica(item.block_id, receipt)
-                    except Exception:
-                        pass
+            if not known.healthy:
+                try:
+                    receipt = ReplicaReceipt(
+                        block_id=item.block_id,
+                        node_id=node_id,
+                        stored_size_bytes=item.stored_size_bytes,
+                        verified_sha256=item.storage_sha256,
+                    )
+                    self._meta.register_recovered_replica(item.block_id, receipt)
+                    reused += 1
+                    logger.debug(
+                        "Réplica reaproveitada na reconciliação",
+                        extra={
+                            "event": "reconcile.replica_reused",
+                            "node_id": node_id,
+                            "block_id": item.block_id,
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Falha ao reaproveitar réplica na reconciliação",
+                        extra={
+                            "event": "reconcile.reuse_failed",
+                            "block_id": item.block_id,
+                            "node_id": node_id,
+                            "error": str(exc),
+                        },
+                    )
 
         logger.info(
-            "reconcile.completed",
-            node_id=node_id,
-            reported_blocks=len(all_blocks),
-            obsolete_blocks=len(obsolete_ids),
+            "Reconciliação concluída",
+            extra={
+                "event": "reconcile.completed",
+                "node_id": node_id,
+                "total_blocks": len(all_blocks),
+                "obsolete": len(obsolete_ids),
+                "reused": reused,
+            },
         )
 
         return obsolete_ids

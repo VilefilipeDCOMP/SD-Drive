@@ -1,71 +1,84 @@
-# ambiente com 1 central + 5 nos de armazenamento, todos com processos provisorios por enquanto.
-# quando o codigo real de cada pessoa ficar pronto, troque so o command (placeholder -> central/storage).
+# ambiente com 1 central + 5 nos de armazenamento.
+# central roda MetadataService (pessoa 1) + ControlService (pessoa 3).
+# storage-N roda StorageService (pessoa 2).
+# cli executa comandos pontuais (pessoa 4).
 #
 # uso:
 #   docker compose up -d --build
 #   docker compose ps
 #   docker compose logs -f
-#   docker compose run --rm cli <comando>      (a cli roda dentro da rede, entao storage-N resolve)
-#   docker compose --profile extra up -d storage-6   (descoberta de no novo, sem reiniciar nada)
-#
-# cada no tem machine_id e disk_id proprios. para simular dois discos na mesma maquina, de ao
-# dois servicos o mesmo machine_id e disk_ids diferentes.
+#   docker compose run --rm cli status
+#   docker compose run --rm cli put /work/arq.txt /drive/arq.txt
+#   docker compose run --rm cli ls /drive/
+#   docker compose --profile extra up -d storage-6   (novo no sem reiniciar nada)
 
 x-common-env: &common-env
   DCOMP_CONFIG: /app/config.yaml
   DCOMP_OBSERVABILITY__METRICS_PORT: "9100"
+  DCOMP_OBSERVABILITY__LOG_FILE: /logs/central.jsonl
 
 x-storage: &storage
   image: dcomp-drive:dev
   build: .
-  command: ["python", "-m", "placeholder", "storage"]
+  command: ["python", "-m", "storage"]
   restart: "no"          # no derrubado de proposito precisa continuar fora do ar para a deteccao aparecer
   networks: [dcomp]
   depends_on:
     central:
       condition: service_healthy
+  volumes:
+    - ./logs:/logs
   healthcheck:
-    test: ["CMD", "python", "-m", "placeholder", "healthcheck", "localhost:50052"]
-    interval: 5s
-    timeout: 3s
+    test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50052'); grpc.channel_ready_future(ch).result(timeout=2)"]
+    interval: 10s
+    timeout: 5s
     retries: 10
+    start_period: 15s
 
 x-storage-env: &storage-env
   <<: *common-env
-  DCOMP_STORAGE__CENTRAL_TARGET: central:50051
+  DCOMP_CONTROLLER_TARGET: central:50051
   # capacidade logica de 2 GiB por no; os volumes docker dividem o disco do host
-  DCOMP_STORAGE__CAPACITY_BYTES: "2147483648"
+  DCOMP_STORAGE_CAPACITY_BYTES: "2147483648"
 
 services:
   central:
     image: dcomp-drive:dev
     build: .
-    command: ["python", "-m", "placeholder", "central"]
+    command: ["python", "-m", "central"]
     restart: unless-stopped
-    networks: [dcomp]
+    networks:
+      dcomp:
+        aliases:
+          - controller   # alias para compatibilidade com clientes que usam controller:50051
     environment:
       <<: *common-env
+      DCOMP_OBSERVABILITY__LOG_FILE: /logs/central.jsonl
     volumes:
       - central-data:/data
+      - ./logs:/logs
     ports:
       - "50051:50051"
       - "9100:9100"
     healthcheck:
-      test: ["CMD", "python", "-m", "placeholder", "healthcheck", "localhost:50051"]
-      interval: 3s
+      test: ["CMD", "python", "-c", "import grpc; ch=grpc.insecure_channel('localhost:50051'); grpc.channel_ready_future(ch).result(timeout=2)"]
+      interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 10s
 
   storage-1:
     <<: *storage
     hostname: storage-1
     environment:
       <<: *storage-env
-      DCOMP_STORAGE__ADVERTISE_ADDR: storage-1:50052
-      DCOMP_STORAGE__MACHINE_ID: machine-1
-      DCOMP_STORAGE__DISK_ID: disk-1
+      DCOMP_STORAGE_ADVERTISE: storage-1:50052
+      DCOMP_MACHINE_ID: machine-1
+      DCOMP_DISK_ID: disk-1
+      DCOMP_OBSERVABILITY__LOG_FILE: /logs/storage-1.jsonl
     volumes:
       - storage-1-data:/data
+      - ./logs:/logs
     ports:
       - "9101:9100"
 
@@ -74,11 +87,13 @@ services:
     hostname: storage-2
     environment:
       <<: *storage-env
-      DCOMP_STORAGE__ADVERTISE_ADDR: storage-2:50052
-      DCOMP_STORAGE__MACHINE_ID: machine-2
-      DCOMP_STORAGE__DISK_ID: disk-2
+      DCOMP_STORAGE_ADVERTISE: storage-2:50052
+      DCOMP_MACHINE_ID: machine-2
+      DCOMP_DISK_ID: disk-2
+      DCOMP_OBSERVABILITY__LOG_FILE: /logs/storage-2.jsonl
     volumes:
       - storage-2-data:/data
+      - ./logs:/logs
     ports:
       - "9102:9100"
 
@@ -87,11 +102,13 @@ services:
     hostname: storage-3
     environment:
       <<: *storage-env
-      DCOMP_STORAGE__ADVERTISE_ADDR: storage-3:50052
-      DCOMP_STORAGE__MACHINE_ID: machine-3
-      DCOMP_STORAGE__DISK_ID: disk-3
+      DCOMP_STORAGE_ADVERTISE: storage-3:50052
+      DCOMP_MACHINE_ID: machine-3
+      DCOMP_DISK_ID: disk-3
+      DCOMP_OBSERVABILITY__LOG_FILE: /logs/storage-3.jsonl
     volumes:
       - storage-3-data:/data
+      - ./logs:/logs
     ports:
       - "9103:9100"
 
@@ -100,11 +117,13 @@ services:
     hostname: storage-4
     environment:
       <<: *storage-env
-      DCOMP_STORAGE__ADVERTISE_ADDR: storage-4:50052
-      DCOMP_STORAGE__MACHINE_ID: machine-4
-      DCOMP_STORAGE__DISK_ID: disk-4
+      DCOMP_STORAGE_ADVERTISE: storage-4:50052
+      DCOMP_MACHINE_ID: machine-4
+      DCOMP_DISK_ID: disk-4
+      DCOMP_OBSERVABILITY__LOG_FILE: /logs/storage-4.jsonl
     volumes:
       - storage-4-data:/data
+      - ./logs:/logs
     ports:
       - "9104:9100"
 
@@ -113,39 +132,45 @@ services:
     hostname: storage-5
     environment:
       <<: *storage-env
-      DCOMP_STORAGE__ADVERTISE_ADDR: storage-5:50052
-      DCOMP_STORAGE__MACHINE_ID: machine-5
-      DCOMP_STORAGE__DISK_ID: disk-5
+      DCOMP_STORAGE_ADVERTISE: storage-5:50052
+      DCOMP_MACHINE_ID: machine-5
+      DCOMP_DISK_ID: disk-5
+      DCOMP_OBSERVABILITY__LOG_FILE: /logs/storage-5.jsonl
     volumes:
       - storage-5-data:/data
+      - ./logs:/logs
     ports:
       - "9105:9100"
 
-  # sexto no so sobe com --profile extra; serve para mostrar a descoberta automatica (rf6)
+  # sexto no so sobe com --profile extra; serve para mostrar a descoberta automatica
   storage-6:
     <<: *storage
     hostname: storage-6
     profiles: ["extra"]
     environment:
       <<: *storage-env
-      DCOMP_STORAGE__ADVERTISE_ADDR: storage-6:50052
-      DCOMP_STORAGE__MACHINE_ID: machine-6
-      DCOMP_STORAGE__DISK_ID: disk-6
+      DCOMP_STORAGE_ADVERTISE: storage-6:50052
+      DCOMP_MACHINE_ID: machine-6
+      DCOMP_DISK_ID: disk-6
+      DCOMP_OBSERVABILITY__LOG_FILE: /logs/storage-6.jsonl
     volumes:
       - storage-6-data:/data
+      - ./logs:/logs
 
-  # cli sob demanda; a chave aes (se usada) deve ser montada aqui como secret e nunca entrar no git
+  # cli sob demanda; a chave aes (se usada) deve ser montada aqui como secret
   cli:
     image: dcomp-drive:dev
     build: .
     profiles: ["tools"]
-    entrypoint: ["python", "-m", "placeholder"]
+    entrypoint: ["python", "-m", "client"]
     networks: [dcomp]
     environment:
       <<: *common-env
       DCOMP_CLIENT__CENTRAL_TARGET: central:50051
+      DCOMP_OBSERVABILITY__LOG_FILE: /logs/client.jsonl
     volumes:
       - ./workspace:/work
+      - ./logs:/logs
     working_dir: /work
 
 networks:
@@ -160,4 +185,3 @@ volumes:
   storage-4-data:
   storage-5-data:
   storage-6-data:
-
