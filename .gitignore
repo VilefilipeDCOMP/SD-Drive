@@ -223,3 +223,10 @@ __marimo__/
 /src/dcomp_drive_pb2.py
 /src/dcomp_drive_pb2_grpc.py
 /src/dcomp_drive_pb2.pyi
+/logs/
+/data/
+/workspace/
+*.key
+*.db
+*.db-shm
+*.db-wal
