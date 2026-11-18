@@ -119,18 +119,29 @@ class TestCorruptionReport:
         assert ("blk-1", "n1") in meta.invalid_calls
         rm.stop()
 
-    def test_corruption_aciona_recovery(self):
+    def test_corruption_aciona_recovery(self, monkeypatch):
         meta = StubMetadata()
         meta.under_replicated = [make_block_record("blk-1")]
         meta.healthy_sources["blk-1"] = [make_node_addr("n1", "n1:50052")]
         meta.destinations["blk-1"] = make_node_addr("n2", "n2:50052")
         reg = make_registry_with_nodes("n1", "n2")
-        rm = RecoveryManager(meta, reg, poll_interval_s=100, grpc_timeout_s=5)
+        rm = RecoveryManager(meta, reg, poll_interval_s=100, grpc_timeout_s=1)
+        monkeypatch.setattr(
+            rm,
+            "_call_copy_block",
+            lambda **kwargs: SimpleNamespace(
+                block_id=kwargs["block_id"],
+                node_id=kwargs["destination"].node_id,
+                stored_size_bytes=kwargs["stored_size_bytes"],
+                verified_storage_sha256=kwargs["storage_sha256"],
+            ),
+        )
         rm.start()
         rm.handle_corruption_report("blk-1", "n1", b"\x00" * 32, "reporter-1")
-        time.sleep(0.5)
+        time.sleep(0.3)
         assert ("blk-1", True) in meta.recovery_states
         assert ("blk-1", False) in meta.recovery_states
+        assert len(meta.recovered_calls) >= 1
         rm.stop()
 
 
