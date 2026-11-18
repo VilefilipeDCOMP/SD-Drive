@@ -2,4 +2,3 @@
 grpcio-tools
 pytest
 pytest-asyncio
-pyyaml
