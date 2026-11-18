@@ -1,165 +1,168 @@
-"""
-src/bootstrap.py
-
-Ponto de inicialização do processo central.
-
-Instancia todos os módulos e injeta as dependências via Protocols definidos
-em src/common/ports.py, evitando imports circulares entre Pessoa 1 e Pessoa 3.
-
-Responsabilidades:
-  1. Carregar configuração (YAML + env vars)
-  2. Instanciar NodeRegistry (Pessoa 3)
-  3. Instanciar MetadataService (Pessoa 1) injetando NodeRegistryPort
-  4. Instanciar RecoveryManager injetando MetadataPort + NodeRegistryPort
-  5. Instanciar ControlServicer com as dependências
-  6. Registrar ambos os serviços no servidor gRPC e iniciar
-
-Referência: ARQUITETURA.md §Interfaces Python internas, CONTRATO.md §9.
-"""
-
 from __future__ import annotations
 
+import argparse
 import os
-import sys
 import signal
+import sys
 import threading
 from concurrent import futures
 
-import yaml
-
-from src.common.logging_config import get_logger
-from src.controller.node_registry import NodeRegistry
-from src.controller.recovery import RecoveryManager
-from src.controller.service import ControlServicer
-
-logger = get_logger("bootstrap")
+from controller.node_registry import NodeRegistry
+from controller.recovery import RecoveryManager
+from controller.service import ControlServicer
 
 
-def load_config(path: str = "config.yaml") -> dict:
-    """Carrega configuração do YAML; env vars sobrescrevem valores específicos."""
-    if not os.path.exists(path):
-        path = "config.example.yaml"
-    with open(path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+def _load_runtime_config(config_path: str | None = None, argv: list[str] | None = None):
+    try:
+        from common.config import add_config_arguments, load_config, load_from_args
+        if argv is not None:
+            parser = argparse.ArgumentParser(prog="central")
+            add_config_arguments(parser)
+            args = parser.parse_args(argv)
+            if config_path and not args.config:
+                args.config = config_path
+            return load_from_args(args)
+        return load_config(config_path)
+    except ImportError:
+        import yaml
+        path = config_path or os.getenv("DCOMP_CONFIG") or "config.example.yaml"
+        if not os.path.exists(path):
+            return {}
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
 
-    # Variáveis de ambiente com prioridade
-    ctrl = cfg.setdefault("controller", {})
-    ctrl.setdefault("grpc_bind", os.getenv("DCOMP_CONTROLLER_BIND", "0.0.0.0:50051"))
-    ctrl.setdefault("heartbeat_interval_seconds", 3)
-    ctrl.setdefault("suspect_timeout_seconds", 10)
-    ctrl.setdefault("dead_timeout_seconds", 30)
-    ctrl.setdefault("max_concurrent_recoveries", 2)
 
-    return cfg
+def _cfg_dict(cfg) -> dict:
+    if hasattr(cfg, "as_dict"):
+        return cfg.as_dict()
+    return dict(cfg)
 
 
-def build_and_run(metadata_port=None, config_path: str = "config.yaml") -> None:
-    """Monta e inicia o processo central.
+def build_and_run(metadata_port=None, config_path: str | None = None, argv: list[str] | None = None) -> int:
+    try:
+        from common.logging import configure_from_config, configure_logging, get_logger
+        configure_logging()
+        log = get_logger("central")
+    except ImportError:
+        import logging
+        configure_from_config = None
+        log = logging.getLogger("central")
 
-    Args:
-        metadata_port: instância de MetadataPort (Pessoa 1).
-                       Se None, usa um stub para permitir desenvolvimento isolado.
-        config_path: caminho para o YAML de configuração.
-    """
-    cfg = load_config(config_path)
-    ctrl_cfg = cfg.get("controller", {})
+    try:
+        cfg = _load_runtime_config(config_path=config_path, argv=argv)
+    except Exception as exc:
+        if hasattr(log, "error"):
+            try:
+                log.error("config.invalid", problems=[str(exc)])
+            except TypeError:
+                log.error("config.invalid: %s", exc)
+        return 2
 
-    # --- 1. NodeRegistry (Pessoa 3) ----------------------------------------
+    cfg_map = _cfg_dict(cfg)
+    if configure_from_config is not None and hasattr(cfg, "observability"):
+        configure_from_config(cfg.observability)
+        log.info("config.loaded", source=getattr(cfg, "source", None), config=cfg_map)
+
+    ctrl_cfg = cfg_map.get("controller", {})
+    cluster_cfg = cfg_map.get("cluster", {})
+    obs_cfg = cfg_map.get("observability", {})
+
     registry = NodeRegistry(
         heartbeat_interval_seconds=ctrl_cfg.get("heartbeat_interval_seconds", 3),
         suspect_timeout_seconds=ctrl_cfg.get("suspect_timeout_seconds", 10),
         dead_timeout_seconds=ctrl_cfg.get("dead_timeout_seconds", 30),
-        max_disk_usage_fraction=cfg.get("cluster", {}).get("max_disk_usage_fraction", 0.90),
+        max_disk_usage_fraction=cluster_cfg.get("max_disk_usage_fraction", 0.90),
     )
 
-    # --- 2. MetadataPort — injetado de fora (Pessoa 1) ----------------------
-    if metadata_port is None:
-        logger.warning(
-            "MetadataPort não fornecido — usando stub de desenvolvimento",
-            extra={"event": "bootstrap.stub_metadata"},
-        )
-        metadata_port = _StubMetadataPort()
+    import grpc
+    import dcomp_drive_pb2_grpc as rpc
 
-    # --- 3. RecoveryManager -------------------------------------------------
+    interceptors = []
+    metrics = None
+    try:
+        from common.metrics import Metrics, MetricsInterceptor, StatusCollector, start_metrics_server
+        metrics = Metrics()
+        interceptors.append(MetricsInterceptor(metrics, "central"))
+    except ImportError:
+        StatusCollector = None
+        start_metrics_server = None
+
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        interceptors=interceptors,
+        options=[
+            ("grpc.max_receive_message_length", 4 * 1024 * 1024 + 65536),
+            ("grpc.max_send_message_length", 4 * 1024 * 1024 + 65536),
+        ],
+    )
+
+    if metadata_port is None:
+        try:
+            from metadata.bootstrap import register_metadata
+            metadata_port = register_metadata(server, registry, cfg_map)
+        except ImportError:
+            metadata_port = _StubMetadataPort()
+
     recovery = RecoveryManager(
         metadata_port=metadata_port,
         node_registry=registry,
         max_concurrent_recoveries=ctrl_cfg.get("max_concurrent_recoveries", 2),
         poll_interval_s=5.0,
         gc_interval_s=60.0,
+        metrics=metrics,
     )
-    recovery.start()
 
-    # --- 4. ControlServicer -------------------------------------------------
     servicer = ControlServicer(
         node_registry=registry,
         metadata_port=metadata_port,
         recovery_manager=recovery,
     )
+    rpc.add_ControlServiceServicer_to_server(servicer, server)
 
-    # --- 5. Servidor gRPC ---------------------------------------------------
-    bind_address = ctrl_cfg.get("grpc_bind", "0.0.0.0:50051")
+    bind_address = ctrl_cfg.get("grpc_bind", os.getenv("DCOMP_CONTROLLER_BIND", "0.0.0.0:50051"))
+    if server.add_insecure_port(bind_address) == 0:
+        return 1
+
+    if metrics is not None and StatusCollector is not None and start_metrics_server is not None:
+        try:
+            from observability.status_cli import status_to_dict
+            from google.protobuf.empty_pb2 import Empty
+            metrics.registry.register(
+                StatusCollector(lambda: status_to_dict(servicer.GetStatus(Empty(), None)))
+            )
+        except Exception:
+            pass
+        start_metrics_server(obs_cfg.get("metrics_port", 9100), metrics)
+
+    server.start()
+    recovery.start()
 
     try:
-        import grpc
-        from src import dcomp_drive_pb2_grpc as pb2_grpc  # type: ignore
+        log.info("service.started", role="central", grpc_bind=bind_address, advertise_addr=bind_address)
+    except TypeError:
+        log.info("service.started %s", bind_address)
 
-        server = grpc.server(
-            futures.ThreadPoolExecutor(max_workers=10),
-            options=[
-                ("grpc.max_receive_message_length", 4 * 1024 * 1024 + 65536),
-                ("grpc.max_send_message_length", 4 * 1024 * 1024 + 65536),
-            ],
-        )
-        pb2_grpc.add_ControlServiceServicer_to_server(servicer, server)
+    stop_event = threading.Event()
 
-        # MetadataService registrado pela Pessoa 1 no mesmo server
-        # (a Pessoa 1 recebe `server` e `registry` como NodeRegistryPort)
+    def _handle_signal(signum, frame):
+        stop_event.set()
 
-        server.add_insecure_port(bind_address)
-        server.start()
-        logger.info(
-            "Processo central iniciado",
-            extra={"event": "server.started", "bind": bind_address},
-        )
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
 
-        # Aguarda sinal de parada
-        stop_event = threading.Event()
+    stop_event.wait()
 
-        def _handle_signal(signum, frame):
-            logger.info("Sinal recebido, encerrando", extra={"event": "server.stopping"})
-            recovery.stop()
-            server.stop(grace=5)
-            stop_event.set()
+    try:
+        log.info("service.stopping", reason="sinal de parada")
+    except TypeError:
+        log.info("service.stopping")
 
-        signal.signal(signal.SIGTERM, _handle_signal)
-        signal.signal(signal.SIGINT, _handle_signal)
+    recovery.stop()
+    server.stop(grace=5).wait()
+    return 0
 
-        stop_event.wait()
-
-    except ImportError:
-        logger.warning(
-            "gRPC não disponível — rodando em modo stub (apenas para testes)",
-            extra={"event": "bootstrap.grpc_unavailable"},
-        )
-        # Mantém processo vivo para testes locais sem gRPC instalado
-        threading.Event().wait()
-
-    except Exception as exc:
-        logger.error(
-            "Falha ao iniciar servidor gRPC",
-            extra={"event": "server.start_failed", "error": str(exc)},
-        )
-        sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Stub para desenvolvimento isolado (sem Pessoa 1 implementada)
-# ---------------------------------------------------------------------------
 
 class _StubMetadataPort:
-    """Implementação vazia de MetadataPort para desenvolvimento/testes."""
-
     def list_under_replicated_blocks(self):
         return []
 
@@ -170,10 +173,10 @@ class _StubMetadataPort:
         return None
 
     def mark_replica_invalid(self, block_id: str, node_id: str):
-        logger.debug("STUB: mark_replica_invalid", extra={"block_id": block_id, "node_id": node_id})
+        pass
 
     def register_recovered_replica(self, block_id: str, receipt):
-        logger.debug("STUB: register_recovered_replica", extra={"block_id": block_id})
+        pass
 
     def list_blocks_on_node(self, node_id: str):
         return []
@@ -181,7 +184,12 @@ class _StubMetadataPort:
     def gc_candidates(self):
         return []
 
+    def acknowledge_gc(self, block_id: str, node_id: str):
+        pass
+
+    def set_recovery_state(self, block_id: str, recovering: bool):
+        pass
+
 
 if __name__ == "__main__":
-    config_file = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
-    build_and_run(config_path=config_file)
+    raise SystemExit(build_and_run(argv=sys.argv[1:]))

@@ -4,6 +4,11 @@ package dcompdrive.v1;
 
 import "google/protobuf/empty.proto";
 
+// CONTRATO BASE ADOTADO para a Parte 1 — alteracoes devem ser comunicadas aos modulos afetados.
+// Plano de controle: MetadataService + ControlService no mesmo processo Python.
+// Plano de dados: StorageService em cada no; o cliente acessa os nos diretamente.
+// Uma chamada StoreBlock equivale a UM bloco logico (por exemplo 4 MiB),
+// transmitido em mensagens pequenas (por exemplo 256 KiB) via streaming.
 
 enum FileState {
   FILE_STATE_UNSPECIFIED = 0;
