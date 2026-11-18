@@ -18,7 +18,9 @@ from client.controller_client import ControllerClient, format_rpc_error
 from client.service import (
     ClientService,
     ClientServiceError,
+    DownloadError,
     InsufficientNodesError,
+    IntegrityError,
     QuorumError,
     UploadError,
 )
@@ -45,4 +47,6 @@ __all__ = [
     "UploadError",
     "QuorumError",
     "InsufficientNodesError",
+    "DownloadError",
+    "IntegrityError",
 ]

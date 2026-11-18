@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import random
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import grpc
 
@@ -14,34 +17,44 @@ import dcomp_drive_pb2 as pb
 from client.chunker import PreparedChunk, PreparedUpload, prepare_file_upload
 from client.config import ClientConfig, load_client_config
 from client.controller_client import ControllerClient, format_rpc_error
-from client.crypto import derive_or_validate_key
+from client.crypto import decrypt_chunk, derive_or_validate_key
 from client.storage_client import StorageClient
 
 logger = logging.getLogger(__name__)
 
 
 class ClientServiceError(Exception):
-    #Exceção base do serviço do cliente
+    # Exceção base do serviço do cliente
     pass
 
 
 class UploadError(ClientServiceError):
-    #Erro durante o processo de upload
+    # Erro durante o processo de upload
     pass
 
 
 class QuorumError(UploadError):
-    #Quórum de escrita não alcançado
+    # Quórum de escrita não alcançado
     pass
 
 
 class InsufficientNodesError(UploadError):
-    #Destinos elegíveis insuficientes para atender o fator de replicação N
+    # Destinos elegíveis insuficientes para atender o fator de replicação N
+    pass
+
+
+class DownloadError(ClientServiceError):
+    # Erro durante o processo de download
+    pass
+
+
+class IntegrityError(DownloadError):
+    # Falha de integridade: hash final do arquivo não confere com o esperado
     pass
 
 
 class _LeaseRenewer(threading.Thread):
-    #Worker em segundo plano para renovação periódica do lease de upload
+    # Worker em segundo plano para renovação periódica do lease de upload
 
     def __init__(
         self,
@@ -128,7 +141,7 @@ class ClientService:
         elif self.config.encryption_enabled:
             validated_key = derive_or_validate_key()
 
-        #Fatiamento e preparação
+        # Fatiamento e preparação
         prepared = prepare_file_upload(
             local,
             remote_path,
@@ -205,7 +218,7 @@ class ClientService:
             )
             renewer.start()
 
-            #Envio em streaming gRPC diretamente aos nós de armazenamento em paralelo
+            # Envio em streaming gRPC diretamente aos nós de armazenamento em paralelo
             chunk_receipts: Dict[str, List[pb.BlockReceipt]] = {
                 c.block_id: [] for c in prepared.chunks
             }
@@ -253,7 +266,7 @@ class ClientService:
             # Para o renovador de lease
             renewer.stop()
 
-            # 6. Verificação do quórum W de recibos por bloco
+            #Verificação do quórum W de recibos por bloco
             quorum_satisfied = True
             for chunk in prepared.chunks:
                 # Contabiliza recibos únicos de nós distintos
@@ -288,7 +301,6 @@ class ClientService:
                     return committed_file
                 except Exception as commit_exc:
                     logger.error(f"Erro no CommitUpload: {commit_exc}")
-                    # Tenta abortar
                     try:
                         self.controller.abort_upload(upload_id)
                     except Exception:
@@ -297,7 +309,7 @@ class ClientService:
                         f"Falha ao confirmar publicação do arquivo: {commit_exc}"
                     ) from commit_exc
 
-            #Falha de quórum: Aborta a tentativa e registra os nós que falharam
+            # Falha de quórum: Aborta a tentativa e registra os nós que falharam
             logger.warning(
                 f"Tentativa {attempt} de upload falhou em atingir o quórum W={write_quorum}. "
                 f"Abortando upload_id {upload_id}."
@@ -317,8 +329,8 @@ class ClientService:
         raise UploadError(
             f"Upload falhou após {max_attempts} tentativas. Último erro: {last_error}"
         )
-        
-    #Envia um bloco a um nó específico
+
+    # Envia um bloco a um nó específico
     def _send_single_block(
         self,
         target_node: pb.NodeAddress,
@@ -333,3 +345,163 @@ class ClientService:
             chunk_size,
         )
 
+    #Executa o fluxo de download:
+    def download_file(
+        self,
+        remote_path: str,
+        destination: str | Path,
+        key: Optional[bytes | str] = None,
+    ) -> pb.FileMetadata:
+        
+        dest = Path(destination).resolve()
+
+        # Validação ou obtenção de chave de criptografia
+        validated_key: Optional[bytes] = None
+        if key is not None:
+            validated_key = derive_or_validate_key(key)
+        elif self.config.encryption_enabled:
+            validated_key = derive_or_validate_key()
+
+        #Resolve metadados da versão COMMITTED
+        try:
+            resolution = self.controller.resolve_download(remote_path)
+        except grpc.RpcError as rpc_err:
+            raise DownloadError(
+                f"Falha ao resolver download: {format_rpc_error(rpc_err)}"
+            ) from rpc_err
+
+        file_meta: pb.FileMetadata = resolution.file
+        chunk_locations: List[pb.ChunkLocation] = list(resolution.chunks)
+
+        # Arquivo vazio —> cria destino vazio diretamente
+        if file_meta.plaintext_size_bytes == 0 or len(chunk_locations) == 0:
+            dest.parent.mkdir(True, True)
+            dest.write_bytes(b"")
+            logger.info(f"Download de arquivo vazio concluído: {remote_path} → {dest}")
+            return file_meta
+
+        # Ordena chunks por índice para montagem correta
+        chunk_locations.sort(key=lambda cl: cl.manifest.index)
+
+        #Arquivo temporário para escrita segura
+        tmp_suffix = f".tmp.{uuid.uuid4().hex[:12]}"
+        tmp_path = dest.parent / (dest.name + tmp_suffix)
+        dest.parent.mkdir(True, True)
+
+        is_encrypted = (
+            file_meta.encryption == pb.ENCRYPTION_AES_256_GCM
+        )
+
+        try:
+            with open(tmp_path, "wb") as tmp_file:
+                for cl in chunk_locations:
+                    manifest: pb.ChunkManifest = cl.manifest
+                    replicas = list(cl.replicas)
+
+                    replicas.sort(key=lambda r: (0 if r.healthy else 1))
+
+                    chunk_recovered = False
+                    for replica in replicas:
+                        node: pb.NodeAddress = replica.node
+                        try:
+                            _header, raw_data = self.storage.get_block(
+                                node.grpc_target, manifest.block_id
+                            )
+
+                            # Verifica SHA-256 dos bytes armazenados
+                            observed_sha256 = hashlib.sha256(raw_data).digest()
+                            if observed_sha256 != manifest.storage_sha256:
+                                # Corrupção detectada —> reporta ao controlador
+                                logger.warning(
+                                    f"Corrupção no bloco {manifest.block_id} "
+                                    f"do nó {node.node_id}: "
+                                    f"hash esperado={manifest.storage_sha256.hex()[:16]}... "
+                                    f"hash observado={observed_sha256.hex()[:16]}..."
+                                )
+                                try:
+                                    self.controller.report_corruption(
+                                        manifest.block_id,
+                                        node.node_id,
+                                        observed_sha256,
+                                    )
+                                except Exception as report_err:
+                                    logger.debug(
+                                        f"Falha ao reportar corrupção: {report_err}"
+                                    )
+                                continue  
+
+                            # Decifra se necessário
+                            if is_encrypted:
+                                if not validated_key:
+                                    raise DownloadError(
+                                        "Arquivo está criptografado com AES-256-GCM, mas nenhuma chave foi informada (--key ou DCOMP_ENCRYPTION_KEY)."
+                                    )
+                                plaintext_chunk = decrypt_chunk(
+                                    raw_data, validated_key, manifest.nonce
+                                )
+                            else:
+                                plaintext_chunk = raw_data
+
+                            tmp_file.write(plaintext_chunk)
+                            chunk_recovered = True
+                            break  
+
+                        except grpc.RpcError as rpc_err:
+                            logger.warning(
+                                f"Falha de rede ao obter bloco {manifest.block_id} "
+                                f"do nó {node.node_id}: {format_rpc_error(rpc_err)}"
+                            )
+                            continue  
+                        except Exception as exc:
+                            logger.warning(
+                                f"Erro inesperado ao obter bloco {manifest.block_id} "
+                                f"do nó {node.node_id}: {exc}"
+                            )
+                            continue
+
+                    if not chunk_recovered:
+                        raise DownloadError(
+                            f"Impossível recuperar o bloco {manifest.block_id} "
+                            f"(índice {manifest.index}) de nenhuma réplica disponível."
+                        )
+
+            # Validação final do arquivo montado
+            assembled_size = tmp_path.stat().st_size
+            if assembled_size != file_meta.plaintext_size_bytes:
+                raise IntegrityError(
+                    f"Tamanho do arquivo montado ({assembled_size} bytes) difere do esperado "
+                    f"({file_meta.plaintext_size_bytes} bytes)."
+                )
+
+            assembled_sha256 = hashlib.sha256(tmp_path.read_bytes()).digest()
+            if assembled_sha256 != file_meta.plaintext_sha256:
+                raise IntegrityError(
+                    f"Hash SHA-256 do arquivo montado "
+                    f"({assembled_sha256.hex()[:16]}...) difere do esperado "
+                    f"({file_meta.plaintext_sha256.hex()[:16]}...)."
+                )
+
+            # Rename atômico 
+            os.replace(str(tmp_path), str(dest))
+            logger.info(
+                f"Download concluído com sucesso: {remote_path} → {dest} "
+                f"({assembled_size} bytes, versão {file_meta.version})"
+            )
+            return file_meta
+
+        except (DownloadError, IntegrityError):
+            self._cleanup_temp(tmp_path)
+            raise
+        except Exception as exc:
+            self._cleanup_temp(tmp_path)
+            raise DownloadError(
+                f"Erro inesperado durante download de {remote_path}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _cleanup_temp(tmp_path: Path) -> None:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError as e:
+            logger.debug(f"Não foi possível remover temp {tmp_path}: {e}")
