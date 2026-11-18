@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import grpc
+from itertools import chain
 
 from controller.logging_compat import get_logger
 from common.ports import MetadataPort
@@ -109,15 +110,15 @@ class ControlServicer:
         return {}
 
     def Reconcile(self, request_iterator, context):
-        node_id = None
-        boot_id = None
+        batches = iter(request_iterator)
+        first = next(batches, None)
+        if first is None:
+            return pb2.ReconcileResponse()
+        node_id = first.node_id
+        boot_id = first.boot_id
 
         def _gen_batches():
-            nonlocal node_id, boot_id
-            for batch in request_iterator:
-                if node_id is None:
-                    node_id = batch.node_id
-                    boot_id = batch.boot_id
+            for batch in chain((first,), batches):
                 items = [
                     InventoryItem(
                         block_id=b.block_id,
@@ -155,12 +156,6 @@ class ControlServicer:
 
         node_statuses = []
         if _PROTO_AVAILABLE:
-            _state_map = {
-                "ALIVE": pb2.NODE_ALIVE,
-                "SUSPECT": pb2.NODE_SUSPECT,
-                "DEAD": pb2.NODE_DEAD,
-                "DRAINING": pb2.NODE_DRAINING,
-            }
             for n in nodes_info:
                 node_statuses.append(
                     pb2.NodeStatus(
@@ -170,7 +165,7 @@ class ControlServicer:
                             disk_id=n.disk_id,
                             grpc_target=n.grpc_target,
                         ),
-                        state=_state_map.get(n.state, pb2.NODE_STATE_UNSPECIFIED),
+                        state=n.state,
                         total_bytes=n.total_bytes,
                         used_bytes=n.used_bytes,
                         available_bytes=n.available_bytes,
@@ -208,14 +203,14 @@ class ControlServicer:
         node_id = request.node_id
 
         state = self._registry.get_node_state(node_id)
-        if state is None:
+        if state == pb2.NODE_STATE_UNSPECIFIED:
             context.set_code(grpc.StatusCode.NOT_FOUND)
             context.set_details(f"Nó {node_id!r} não encontrado.")
             if _PROTO_AVAILABLE:
                 return pb2.DrainNodeResponse()
             return {"job_id": ""}
 
-        if state == "DRAINING":
+        if state == pb2.NODE_DRAINING:
             context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
             context.set_details(f"Nó {node_id!r} já está em DRAINING.")
             if _PROTO_AVAILABLE:

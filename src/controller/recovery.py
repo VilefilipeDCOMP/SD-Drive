@@ -10,7 +10,7 @@ from typing import Optional
 import grpc
 
 from controller.logging_compat import get_logger
-from common.ports import MetadataPort, NodeRegistryPort, ReplicaReceipt
+from common.ports import MetadataPort, NodeRegistryPort
 
 logger = get_logger("controller.recovery")
 
@@ -162,7 +162,7 @@ class RecoveryManager:
             for block_info in blocks:
                 fut = self._executor.submit(
                     self._recover_single_block,
-                    block_info.block_id,
+                    block_info["block_id"],
                     exclude_node_ids={node_id},
                 )
                 futures.append(fut)
@@ -232,7 +232,8 @@ class RecoveryManager:
             in_flight = set(self._in_flight_blocks)
 
         scheduled = 0
-        for block_id, alive_replicas, desired_replicas in under_replicated:
+        for record in under_replicated:
+            block_id = record["block_id"]
             if block_id in in_flight:
                 continue
             if not self._semaphore.acquire(blocking=False):
@@ -264,6 +265,7 @@ class RecoveryManager:
 
         self._semaphore.acquire()
         job_id = str(uuid.uuid4())
+        recovering = False
 
         try:
             sources = self._meta.list_healthy_sources(block_id)
@@ -276,6 +278,13 @@ class RecoveryManager:
                         "job_id": job_id,
                     },
                 )
+                return
+
+            record = next(
+                (record for record in self._meta.list_under_replicated_blocks() if record["block_id"] == block_id),
+                None,
+            )
+            if record is None:
                 return
 
             source = sources[0]
@@ -318,18 +327,19 @@ class RecoveryManager:
                 },
             )
 
-            source_target = self._registry.get_node_capacity(source.node_id)
             source_grpc_target = self._get_grpc_target(source.node_id)
             if not source_grpc_target:
                 raise RuntimeError(f"grpc_target desconhecido para {source.node_id}")
 
+            self._meta.set_recovery_state(block_id, True)
+            recovering = True
             receipt = self._call_copy_block(
                 source_grpc_target=source_grpc_target,
                 block_id=block_id,
-                destination_node_id=destination.node_id,
-                destination_grpc_target=destination.grpc_target,
-                stored_size_bytes=source.stored_size_bytes,
-                version=source.version,
+                destination=destination,
+                stored_size_bytes=record["manifest"].stored_size_bytes,
+                version=record["version"],
+                storage_sha256=record["manifest"].storage_sha256,
             )
 
             self._meta.register_recovered_replica(block_id, receipt)
@@ -349,22 +359,29 @@ class RecoveryManager:
             )
 
         except Exception as exc:
+            error = str(exc) or type(exc).__name__
             logger.error(
                 "Recuperação falhou",
                 extra={
                     "event": "recovery.failed",
                     "job_id": job_id,
                     "block_id": block_id,
-                    "error": str(exc),
+                    "error": error,
+                    "error_type": type(exc).__name__,
                 },
             )
             with self._jobs_lock:
                 if job_id in self._active_jobs:
                     self._active_jobs[job_id].completed_at = time.time()
                     self._active_jobs[job_id].success = False
-                    self._active_jobs[job_id].error = str(exc)
+                    self._active_jobs[job_id].error = error
 
         finally:
+            if recovering:
+                try:
+                    self._meta.set_recovery_state(block_id, False)
+                except Exception:
+                    logger.exception("Falha ao encerrar estado de recuperação")
             with self._jobs_lock:
                 self._in_flight_blocks.discard(block_id)
             self._semaphore.release()
@@ -382,37 +399,16 @@ class RecoveryManager:
         self,
         source_grpc_target: str,
         block_id: str,
-        destination_node_id: str,
-        destination_grpc_target: str,
+        destination,
         stored_size_bytes: int,
         version: int,
         storage_sha256: bytes = b"",
-    ) -> ReplicaReceipt:
-        if not _PROTO_AVAILABLE:
-            logger.warning(
-                "Modo stub: simulando CopyBlock",
-                extra={
-                    "event": "recovery.stub_copy",
-                    "block_id": block_id,
-                    "destination": destination_grpc_target,
-                },
-            )
-            return ReplicaReceipt(
-                block_id=block_id,
-                node_id=destination_node_id,
-                stored_size_bytes=stored_size_bytes,
-                verified_sha256=storage_sha256,
-            )
-
+    ) -> pb2.BlockReceipt:
         with grpc.insecure_channel(source_grpc_target) as channel:
             stub = pb2_grpc.StorageServiceStub(channel)
-            dest_node_addr = pb2.NodeAddress(
-                node_id=destination_node_id,
-                grpc_target=destination_grpc_target,
-            )
             request = pb2.CopyBlockRequest(
                 block_id=block_id,
-                destination=dest_node_addr,
+                destination=destination,
                 expected_storage_sha256=storage_sha256,
                 stored_size_bytes=stored_size_bytes,
                 version=version,
@@ -420,12 +416,7 @@ class RecoveryManager:
             response = stub.CopyBlock(
                 request, timeout=self._grpc_timeout
             )
-            return ReplicaReceipt(
-                block_id=response.block_id,
-                node_id=response.node_id,
-                stored_size_bytes=response.stored_size_bytes,
-                verified_sha256=bytes(response.verified_storage_sha256),
-            )
+            return response
 
     def _gc_loop(self) -> None:
         while self._running:
@@ -456,8 +447,8 @@ class RecoveryManager:
             extra={"event": "gc.started", "count": len(candidates)},
         )
 
-        for block_id, node_id in candidates:
-            self._executor.submit(self._delete_block_on_node, block_id, node_id)
+        for candidate in candidates:
+            self._executor.submit(self._delete_block_on_node, candidate["block_id"], candidate["node"].node_id)
 
     def _delete_block_on_node(self, block_id: str, node_id: str) -> None:
         grpc_target = self._get_grpc_target(node_id)
@@ -482,6 +473,7 @@ class RecoveryManager:
                     pb2.DeleteBlockRequest(block_id=block_id),
                     timeout=30,
                 )
+            self._meta.acknowledge_gc(block_id, node_id)
             logger.info(
                 "GC: bloco removido do nó",
                 extra={"event": "gc.block_deleted", "block_id": block_id, "node_id": node_id},

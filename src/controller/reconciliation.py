@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import Iterator
 
 from controller.logging_compat import get_logger
-from common.ports import MetadataPort, ReplicaReceipt
+import dcomp_drive_pb2 as pb2
+from common.ports import MetadataPort
 
 logger = get_logger("controller.reconciliation")
 
@@ -60,7 +61,7 @@ class ReconciliationService:
 
         try:
             known_on_node = {
-                b.block_id: b
+                b["block_id"]: b
                 for b in self._meta.list_blocks_on_node(node_id)
             }
         except Exception as exc:
@@ -82,13 +83,13 @@ class ReconciliationService:
                 obsolete_ids.append(item.block_id)
                 continue
 
-            if not known.healthy:
+            if not any(replica.node.node_id == node_id and replica.healthy for replica in known["replicas"]):
                 try:
-                    receipt = ReplicaReceipt(
+                    receipt = pb2.BlockReceipt(
                         block_id=item.block_id,
                         node_id=node_id,
                         stored_size_bytes=item.stored_size_bytes,
-                        verified_sha256=item.storage_sha256,
+                        verified_storage_sha256=item.storage_sha256,
                     )
                     self._meta.register_recovered_replica(item.block_id, receipt)
                     reused += 1

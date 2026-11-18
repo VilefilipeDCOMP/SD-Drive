@@ -109,6 +109,47 @@ class TestRecoveryManagerBasic:
 
 
 class TestCorruptionReport:
+    def test_corruption_sem_deficit_nao_cria_job(self, monkeypatch):
+        meta = StubMetadata()
+        meta.healthy_sources["blk-1"] = [make_node_addr(node) for node in ("n1", "n2", "n3")]
+        meta.destinations["blk-1"] = make_node_addr("n5")
+        reg = make_registry_with_nodes("n1", "n2", "n3", "n4", "n5")
+        rm = RecoveryManager(meta, reg)
+        selected = []
+        select_destination = meta.select_destination
+
+        def record_selection(block_id, excluded_node_ids):
+            selected.append(block_id)
+            return select_destination(block_id, excluded_node_ids)
+
+        monkeypatch.setattr(meta, "select_destination", record_selection)
+        monkeypatch.setattr(rm._executor, "submit", lambda fn, *args: fn(*args))
+        try:
+            rm.handle_corruption_report("blk-1", "n4", b"\x00" * 32, "n4")
+            assert meta.invalid_calls == [("blk-1", "n4")]
+            assert selected == []
+            assert rm.get_active_jobs() == []
+        finally:
+            rm.stop()
+
+    def test_deficit_resolvido_apos_varredura_nao_cria_job(self, monkeypatch):
+        meta = StubMetadata()
+        meta.under_replicated = [make_block_record("blk-1", live_count=2)]
+        meta.healthy_sources["blk-1"] = [make_node_addr(node) for node in ("n1", "n2", "n3")]
+        meta.destinations["blk-1"] = make_node_addr("n4")
+        rm = RecoveryManager(meta, make_registry_with_nodes("n1", "n2", "n3", "n4"))
+        scheduled = []
+        monkeypatch.setattr(rm._executor, "submit", lambda fn, *args: scheduled.append((fn, args)))
+        try:
+            rm._scan_and_recover()
+            assert len(scheduled) == 1
+            meta.under_replicated.clear()
+            fn, args = scheduled[0]
+            fn(*args)
+            assert rm.get_active_jobs() == []
+        finally:
+            rm.stop()
+
     def test_corruption_marca_replica_invalida(self):
         meta = StubMetadata()
         reg = make_registry_with_nodes("n1")

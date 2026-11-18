@@ -7,14 +7,15 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from controller.logging_compat import get_logger
-from common.ports import NodeInfo, NodeRegistryPort
+from common.ports import NodeSnapshot, NodeRegistryPort
+from dcomp_drive_pb2 import NODE_ALIVE, NODE_SUSPECT, NODE_DEAD, NODE_DRAINING, NODE_STATE_UNSPECIFIED
 
 logger = get_logger("controller.node_registry")
 
-STATE_ALIVE = "ALIVE"
-STATE_SUSPECT = "SUSPECT"
-STATE_DEAD = "DEAD"
-STATE_DRAINING = "DRAINING"
+STATE_ALIVE = NODE_ALIVE
+STATE_SUSPECT = NODE_SUSPECT
+STATE_DEAD = NODE_DEAD
+STATE_DRAINING = NODE_DRAINING
 
 _MAX_DISK_USAGE_FRACTION = 0.90
 
@@ -27,15 +28,15 @@ class _NodeEntry:
     disk_id: str
     grpc_target: str
     boot_id: str
-    state: str = STATE_ALIVE
+    state: int = STATE_ALIVE
     total_bytes: int = 0
     used_bytes: int = 0
     available_bytes: int = 0
     last_heartbeat: float = field(default_factory=time.monotonic)
     registered_at: float = field(default_factory=time.monotonic)
 
-    def to_node_info(self) -> NodeInfo:
-        return NodeInfo(
+    def to_node_info(self) -> NodeSnapshot:
+        return NodeSnapshot(
             node_id=self.node_id,
             machine_id=self.machine_id,
             disk_id=self.disk_id,
@@ -223,7 +224,7 @@ class NodeRegistry:
     def add_state_listener(self, fn) -> None:
         self._state_listeners.append(fn)
 
-    def list_eligible_nodes(self) -> list[NodeInfo]:
+    def list_eligible_nodes(self) -> tuple[NodeSnapshot, ...]:
         with self._lock:
             result = []
             for entry in self._nodes.values():
@@ -234,25 +235,25 @@ class NodeRegistry:
                     if usage_fraction >= self._max_usage:
                         continue
                 result.append(entry.to_node_info())
-            return result
+            return tuple(result)
 
-    def get_node_state(self, node_id: str) -> Optional[str]:
+    def get_node_state(self, node_id: str) -> int:
         with self._lock:
             entry = self._nodes.get(node_id)
-            return entry.state if entry else None
+            return entry.state if entry else NODE_STATE_UNSPECIFIED
 
-    def get_node_capacity(self, node_id: str) -> Optional[tuple[int, int, int]]:
+    def get_node_capacity(self, node_id: str) -> NodeSnapshot:
         with self._lock:
             entry = self._nodes.get(node_id)
             if entry is None:
-                return None
-            return (entry.total_bytes, entry.used_bytes, entry.available_bytes)
+                raise KeyError(node_id)
+            return entry.to_node_info()
 
-    def get_all_nodes(self) -> list[NodeInfo]:
+    def get_all_nodes(self) -> list[NodeSnapshot]:
         with self._lock:
             return [e.to_node_info() for e in self._nodes.values()]
 
-    def get_node(self, node_id: str) -> Optional[NodeInfo]:
+    def get_node(self, node_id: str) -> Optional[NodeSnapshot]:
         with self._lock:
             entry = self._nodes.get(node_id)
             return entry.to_node_info() if entry else None
@@ -307,7 +308,7 @@ class NodeRegistry:
                     )
                     self._notify_state_change(entry.node_id, old_state, STATE_SUSPECT)
 
-    def _notify_state_change(self, node_id: str, old_state: str, new_state: str) -> None:
+    def _notify_state_change(self, node_id: str, old_state: int, new_state: int) -> None:
         for fn in self._state_listeners:
             try:
                 fn(node_id, old_state, new_state)
