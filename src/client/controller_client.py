@@ -73,7 +73,7 @@ class ControllerClient:
                     ("grpc.max_receive_message_length", 32 * 1024 * 1024),
                     ("grpc.max_send_message_length", 32 * 1024 * 1024),
                 ]
-                self.channel = grpc.insecure_channel(target, options)
+                self.channel = grpc.insecure_channel(target, options=options)
 
             self.metadata_stub = metadata_stub or rpc.MetadataServiceStub(self.channel)
             self.control_stub = control_stub or rpc.ControlServiceStub(self.channel)
@@ -100,15 +100,15 @@ class ControllerClient:
         timeout: Optional[float] = None,
     ) -> pb.AllocateUploadResponse:
         req = pb.AllocateUploadRequest(
-            path,
-            operation_id,
-            plaintext_size_bytes,
-            plaintext_sha256,
-            encryption,
-            chunks,
-            overwrite,
-            expected_version,
-            excluded_node_ids or [],
+            path=path,
+            operation_id=operation_id,
+            plaintext_size_bytes=plaintext_size_bytes,
+            plaintext_sha256=plaintext_sha256,
+            encryption=encryption,
+            chunks=chunks,
+            overwrite=overwrite,
+            expected_version=expected_version,
+            excluded_node_ids=excluded_node_ids or [],
         )
         return self.metadata_stub.AllocateUpload(
             req, timeout=timeout or self.default_timeout
@@ -118,7 +118,7 @@ class ControllerClient:
     def renew_lease(
         self, upload_id: str, timeout: Optional[float] = None
     ) -> pb.RenewLeaseResponse:
-        req = pb.RenewLeaseRequest(upload_id)
+        req = pb.RenewLeaseRequest(upload_id=upload_id)
         return self.metadata_stub.RenewLease(
             req, timeout=timeout or self.default_timeout
         )
@@ -130,7 +130,7 @@ class ControllerClient:
         receipts: List[pb.BlockReceipt],
         timeout: Optional[float] = None,
     ) -> pb.FileMetadata:
-        req = pb.CommitUploadRequest(upload_id, receipts)
+        req = pb.CommitUploadRequest(upload_id=upload_id, receipts=receipts)
         return self.metadata_stub.CommitUpload(
             req, timeout=timeout or self.default_timeout
         )
@@ -139,7 +139,7 @@ class ControllerClient:
     def abort_upload(
         self, upload_id: str, timeout: Optional[float] = None
     ) -> None:
-        req = pb.AbortUploadRequest(upload_id)
+        req = pb.AbortUploadRequest(upload_id=upload_id)
         self.metadata_stub.AbortUpload(req, timeout=timeout or self.default_timeout)
 
     #Obtém a lista de chunks e nós réplicas para leitura de versão
@@ -158,7 +158,7 @@ class ControllerClient:
         expected_version: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> None:
-        req = pb.DeleteRequest(path, expected_version)
+        req = pb.DeleteRequest(path=path, expected_version=expected_version)
         self.metadata_stub.Delete(req, timeout=timeout or self.default_timeout)
 
     #Renomeia ou move um arquivo/diretório de modo atômico
@@ -170,7 +170,7 @@ class ControllerClient:
         timeout: Optional[float] = None,
     ) -> None:
         req = pb.RenameRequest(
-            source_path, target_path, overwrite
+            source_path=source_path, target_path=target_path, overwrite=overwrite
         )
         self.metadata_stub.Rename(req, timeout=timeout or self.default_timeout)
 
@@ -183,25 +183,25 @@ class ControllerClient:
         timeout: Optional[float] = None,
     ) -> pb.ListDirResponse:
         req = pb.ListDirRequest(
-            path, page_size, page_token
+            path=path, page_size=page_size, page_token=page_token
         )
         return self.metadata_stub.ListDir(req, timeout=timeout or self.default_timeout)
 
     #Consulta metadados de arquivo ou diretório
     def stat(self, path: str, timeout: Optional[float] = None) -> pb.StatResponse:
-        req = pb.StatRequest(path)
+        req = pb.StatRequest(path=path)
         return self.metadata_stub.Stat(req, timeout=timeout or self.default_timeout)
 
     #Cria um novo diretório no namespace
     def mkdir(self, path: str, timeout: Optional[float] = None) -> None:
-        req = pb.MkdirRequest(path)
+        req = pb.MkdirRequest(path=path)
         self.metadata_stub.Mkdir(req, timeout=timeout or self.default_timeout)
     
     #Remove um diretório (opcionalmente recursivo)
     def rmdir(
         self, path: str, recursive: bool = False, timeout: Optional[float] = None
     ) -> None:    
-        req = pb.RmdirRequest(path, recursive)
+        req = pb.RmdirRequest(path=path, recursive=recursive)
         self.metadata_stub.Rmdir(req, timeout=timeout or self.default_timeout)
 
     # Métodos do ControlService
@@ -232,10 +232,10 @@ class ControllerClient:
         timeout: Optional[float] = None,
     ) -> None:
         req = pb.ReportCorruptionRequest(
-            block_id,
-            suspected_node_id,
-            observed_sha256,
-            reporter_id,
+            block_id=block_id,
+            suspected_node_id=suspected_node_id,
+            observed_sha256=observed_sha256,
+            reporter_id=reporter_id,
         )
         self.control_stub.ReportCorruption(
             req, timeout=timeout or self.default_timeout

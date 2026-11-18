@@ -143,10 +143,10 @@ class ClientService:
 
         # Fatiamento e preparação
         prepared = prepare_file_upload(
-            local,
-            remote_path,
-            self.config.logical_chunk_size_bytes,
-            validated_key,
+            file_path=local,
+            remote_path=remote_path,
+            chunk_size=self.config.logical_chunk_size_bytes,
+            key=validated_key,
         )
 
         excluded_node_ids: Set[str] = set()
@@ -175,15 +175,15 @@ class ClientService:
             # Alocação de Upload no Controlador
             try:
                 allocation = self.controller.allocate_upload(
-                    remote_path,
-                    operation_id,
-                    prepared.plaintext_size_bytes,
-                    prepared.plaintext_sha256,
-                    prepared.encryption_mode,
-                    prepared.manifests,
-                    overwrite,
-                    expected_version,
-                    sorted(list(excluded_node_ids)),
+                    path=remote_path,
+                    operation_id=operation_id,
+                    plaintext_size_bytes=prepared.plaintext_size_bytes,
+                    plaintext_sha256=prepared.plaintext_sha256,
+                    encryption=prepared.encryption_mode,
+                    chunks=prepared.manifests,
+                    overwrite=overwrite,
+                    expected_version=expected_version,
+                    excluded_node_ids=sorted(list(excluded_node_ids)),
                 )
             except grpc.RpcError as rpc_err:
                 code = rpc_err.code() if hasattr(rpc_err, "code") else None
@@ -203,18 +203,18 @@ class ClientService:
             if prepared.plaintext_size_bytes == 0 or len(prepared.chunks) == 0:
                 try:
                     committed_meta = self.controller.commit_upload(
-                        upload_id, []
+                        upload_id=upload_id, receipts=[]
                     )
                     return committed_meta
                 except Exception as e:
-                    self.controller.abort_upload(upload_id)
+                    self.controller.abort_upload(upload_id=upload_id)
                     raise UploadError(f"Falha ao realizar commit de arquivo vazio: {e}") from e
 
             # Inicia o renovador assíncrono de lease
             renewer = _LeaseRenewer(
-                self.controller,
-                upload_id,
-                self.config.lease_renew_interval_seconds,
+                controller=self.controller,
+                upload_id=upload_id,
+                interval_seconds=self.config.lease_renew_interval_seconds,
             )
             renewer.start()
 
@@ -234,11 +234,11 @@ class ClientService:
 
                     for target_node in placement.targets:
                         header = pb.StoreBlockHeader(
-                            chunk.block_id,
-                            upload_id,
-                            allocation.version,
-                            chunk.stored_size_bytes,
-                            chunk.storage_sha256,
+                            block_id=chunk.block_id,
+                            upload_id=upload_id,
+                            version=allocation.version,
+                            expected_size_bytes=chunk.stored_size_bytes,
+                            expected_storage_sha256=chunk.storage_sha256,
                         )
                         task = executor.submit(
                             self._send_single_block,
@@ -292,7 +292,7 @@ class ClientService:
 
                 try:
                     committed_file = self.controller.commit_upload(
-                        upload_id, all_receipts
+                        upload_id=upload_id, receipts=all_receipts
                     )
                     logger.info(
                         f"Upload concluído com sucesso para {remote_path} "
@@ -302,7 +302,7 @@ class ClientService:
                 except Exception as commit_exc:
                     logger.error(f"Erro no CommitUpload: {commit_exc}")
                     try:
-                        self.controller.abort_upload(upload_id)
+                        self.controller.abort_upload(upload_id=upload_id)
                     except Exception:
                         pass
                     raise UploadError(
@@ -315,7 +315,7 @@ class ClientService:
                 f"Abortando upload_id {upload_id}."
             )
             try:
-                self.controller.abort_upload(upload_id)
+                self.controller.abort_upload(upload_id=upload_id)
             except Exception as abort_exc:
                 logger.debug(f"Aviso ao abortar upload: {abort_exc}")
 
@@ -339,10 +339,10 @@ class ClientService:
         chunk_size: int,
     ) -> pb.BlockReceipt:
         return self.storage.store_block(
-            target_node.grpc_target,
-            header,
-            data,
-            chunk_size,
+            grpc_target=target_node.grpc_target,
+            header=header,
+            data=data,
+            frame_size_bytes=chunk_size,
         )
 
     #Executa o fluxo de download:
@@ -375,7 +375,7 @@ class ClientService:
 
         # Arquivo vazio —> cria destino vazio diretamente
         if file_meta.plaintext_size_bytes == 0 or len(chunk_locations) == 0:
-            dest.parent.mkdir(True, True)
+            dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(b"")
             logger.info(f"Download de arquivo vazio concluído: {remote_path} → {dest}")
             return file_meta
@@ -386,7 +386,7 @@ class ClientService:
         #Arquivo temporário para escrita segura
         tmp_suffix = f".tmp.{uuid.uuid4().hex[:12]}"
         tmp_path = dest.parent / (dest.name + tmp_suffix)
-        dest.parent.mkdir(True, True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
 
         is_encrypted = (
             file_meta.encryption == pb.ENCRYPTION_AES_256_GCM
@@ -405,7 +405,7 @@ class ClientService:
                         node: pb.NodeAddress = replica.node
                         try:
                             _header, raw_data = self.storage.get_block(
-                                node.grpc_target, manifest.block_id
+                                grpc_target=node.grpc_target, block_id=manifest.block_id
                             )
 
                             # Verifica SHA-256 dos bytes armazenados
@@ -420,9 +420,9 @@ class ClientService:
                                 )
                                 try:
                                     self.controller.report_corruption(
-                                        manifest.block_id,
-                                        node.node_id,
-                                        observed_sha256,
+                                        block_id=manifest.block_id,
+                                        suspected_node_id=node.node_id,
+                                        observed_sha256=observed_sha256,
                                     )
                                 except Exception as report_err:
                                     logger.debug(
@@ -437,7 +437,7 @@ class ClientService:
                                         "Arquivo está criptografado com AES-256-GCM, mas nenhuma chave foi informada (--key ou DCOMP_ENCRYPTION_KEY)."
                                     )
                                 plaintext_chunk = decrypt_chunk(
-                                    raw_data, validated_key, manifest.nonce
+                                    ciphertext=raw_data, key=validated_key, nonce=manifest.nonce
                                 )
                             else:
                                 plaintext_chunk = raw_data

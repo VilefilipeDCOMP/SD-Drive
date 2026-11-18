@@ -24,6 +24,8 @@ from client.service import (
     QuorumError,
     UploadError,
 )
+from client.observability import OperationTracker, record_operation_event
+from client.cli import app as cli_app
 
 __all__ = [
     "ClientConfig",
@@ -49,4 +51,7 @@ __all__ = [
     "InsufficientNodesError",
     "DownloadError",
     "IntegrityError",
+    "OperationTracker",
+    "record_operation_event",
+    "cli_app",
 ]
