@@ -20,6 +20,8 @@ x-storage: &storage
   build: .
   command: ["python", "-m", "placeholder", "storage"]
   restart: "no"          # no derrubado de proposito precisa continuar fora do ar para a deteccao aparecer
+  cap_add:
+    - NET_ADMIN          # permite injetar latencia e perda de pacotes com tc netem nos testes
   networks: [dcomp]
   depends_on:
     central:
@@ -49,6 +51,7 @@ services:
       - central-data:/data
     ports:
       - "50051:50051"
+      - "9100:9100"
     healthcheck:
       test: ["CMD", "python", "-m", "placeholder", "healthcheck", "localhost:50051"]
       interval: 3s
@@ -65,6 +68,8 @@ services:
       DCOMP_STORAGE__DISK_ID: disk-1
     volumes:
       - storage-1-data:/data
+    ports:
+      - "9101:9100"
 
   storage-2:
     <<: *storage
@@ -76,6 +81,8 @@ services:
       DCOMP_STORAGE__DISK_ID: disk-2
     volumes:
       - storage-2-data:/data
+    ports:
+      - "9102:9100"
 
   storage-3:
     <<: *storage
@@ -87,6 +94,8 @@ services:
       DCOMP_STORAGE__DISK_ID: disk-3
     volumes:
       - storage-3-data:/data
+    ports:
+      - "9103:9100"
 
   storage-4:
     <<: *storage
@@ -98,6 +107,8 @@ services:
       DCOMP_STORAGE__DISK_ID: disk-4
     volumes:
       - storage-4-data:/data
+    ports:
+      - "9104:9100"
 
   storage-5:
     <<: *storage
@@ -109,6 +120,8 @@ services:
       DCOMP_STORAGE__DISK_ID: disk-5
     volumes:
       - storage-5-data:/data
+    ports:
+      - "9105:9100"
 
   # sexto no so sobe com --profile extra; serve para mostrar a descoberta automatica (rf6)
   storage-6:

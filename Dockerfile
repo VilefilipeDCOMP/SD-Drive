@@ -12,6 +12,9 @@ WORKDIR /app
 COPY requirements.txt requirements-dev.txt ./
 RUN pip install -r requirements-dev.txt
 
+# iproute2 traz o comando tc, usado pelos scripts de falha para simular atraso e perda de pacotes
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
+
 COPY proto ./proto
 COPY src ./src
 COPY config.example.yaml ./config.yaml
