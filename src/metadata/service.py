@@ -266,6 +266,18 @@ class MetadataService(rpc.MetadataServiceServicer):
 
         raise AllocationError(grpc.StatusCode.FAILED_PRECONDITION, "Arquivo confirmado sem manifesto correspondente")
 
+    def count_files_by_replication_state(self) -> dict[int, int]:
+        with self._transaction("count_files_by_replication_state"):
+            counts = {}
+            for stored in self._files.values():
+                metadata = pb.FileMetadata.FromString(stored)
+                if metadata.state != pb.FILE_COMMITTED:
+                    continue
+                manifest, allocation, confirmed = self._find_committed_upload(metadata)
+                _, state = self._build_download_chunks(manifest, allocation, confirmed)
+                counts[state] = counts.get(state, 0) + 1
+            return counts
+
     def _build_download_chunks(self, manifest, allocation, confirmed):
         placements = {}
         for placement in allocation.chunks:

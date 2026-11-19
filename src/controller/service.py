@@ -172,32 +172,18 @@ class ControlServicer:
                     )
                 )
 
-        healthy = under_rep = recovering = unavailable = 0
-        try:
-            blocks = self._meta.list_under_replicated_blocks()
-            under_rep = len(blocks)
-        except Exception:
-            pass
-
-        running_jobs = self._recovery.running_job_count()
+        counts = self._meta.count_files_by_replication_state()
+        summary = {
+            "healthy_files": counts.get(pb2.REPLICATION_HEALTHY, 0),
+            "under_replicated_files": counts.get(pb2.REPLICATION_UNDER_REPLICATED, 0),
+            "recovering_files": counts.get(pb2.REPLICATION_RECOVERING, 0),
+            "unavailable_files": counts.get(pb2.REPLICATION_UNAVAILABLE, 0),
+            "running_recovery_jobs": self._recovery.running_job_count(),
+        }
 
         if _PROTO_AVAILABLE:
-            return pb2.GetStatusResponse(
-                nodes=node_statuses,
-                healthy_files=healthy,
-                under_replicated_files=under_rep,
-                recovering_files=recovering,
-                unavailable_files=unavailable,
-                running_recovery_jobs=running_jobs,
-            )
-        return {
-            "nodes": [n.__dict__ for n in nodes_info],
-            "healthy_files": healthy,
-            "under_replicated_files": under_rep,
-            "recovering_files": recovering,
-            "unavailable_files": unavailable,
-            "running_recovery_jobs": running_jobs,
-        }
+            return pb2.GetStatusResponse(nodes=node_statuses, **summary)
+        return {"nodes": [n.__dict__ for n in nodes_info], **summary}
 
     def DrainNode(self, request, context):
         node_id = request.node_id
