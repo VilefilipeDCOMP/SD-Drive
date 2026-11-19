@@ -1,17 +1,15 @@
 # Roteiro de Demonstração — SD-Drive Parte 1
 
-**Tempo total:** ≤ 5 minutos  
+**Tempo alvo:** até 5 minutos. As etapas de falha e corrupção dependem dos intervalos do cluster.  
 **Requisito:** Docker e Docker Compose instalados, repositório clonado.
 
 ---
 
 ## Preparação (antes da demo — não conta no tempo)
 
+Execute os comandos na raiz do repositório e no mesmo terminal para manter as variáveis. O Dockerfile instala as dependências e gera os stubs. Para demonstrar a entrada do sexto nó, comece com o `storage-6` parado.
+
 ```bash
-git clone https://github.com/VilefilipeDCOMP/SD-Drive.git
-cd SD-Drive
-pip install -r requirements-dev.txt
-python scripts/gerar_proto.py
 docker compose build
 ```
 
@@ -22,31 +20,37 @@ docker compose build
 ### [0:00 – 0:30] Subir o cluster
 
 ```bash
-docker compose up -d
+docker compose up -d --wait
 docker compose ps
 ```
 
-**Mostrar:** 7 serviços (central + storage-1..5 + storage-6 parado) todos **healthy**.
+**Mostrar:** seis serviços **healthy**: o central e os cinco storages iniciais.
 
 ---
 
 ### [0:30 – 1:30] Put e Get de arquivo (cenário V1)
 
+Crie o diretório remoto uma vez. Se `/drive` já existir, pule o `mkdir` da CLI.
+
 ```bash
-# criar arquivo de teste
-echo "SD-Drive funciona!" > /tmp/teste.txt
+docker compose run --rm cli mkdir /drive
+```
 
-# enviar para o cluster
-docker compose run --rm --profile tools cli put /tmp/teste.txt /drive/teste.txt
+A pasta `workspace/` do host é montada em `/work` na CLI. Cada execução usa um nome novo para preservar os arquivos das demos anteriores.
 
-# baixar de volta
-docker compose run --rm --profile tools cli get /drive/teste.txt /tmp/baixado.txt
+```bash
+mkdir -p workspace
+PASTA_DEMO=$(mktemp -d workspace/demo.XXXXXX)
+# Permitir que o usuário da CLI no contêiner grave os arquivos baixados.
+chmod a+rwx "$PASTA_DEMO"
+NOME_DEMO=${PASTA_DEMO##*/}
+ARQUIVO_REMOTO="/drive/${NOME_DEMO}.txt"
+printf '%s\n' 'SD-Drive funciona!' > "$PASTA_DEMO/original.txt"
 
-# verificar conteúdo idêntico
-diff /tmp/teste.txt /tmp/baixado.txt && echo "ARQUIVOS IDENTICOS"
-
-# listar namespace
-docker compose run --rm --profile tools cli ls /drive/
+docker compose run --rm cli put "/work/$NOME_DEMO/original.txt" "$ARQUIVO_REMOTO"
+docker compose run --rm cli get "$ARQUIVO_REMOTO" "/work/$NOME_DEMO/baixado.txt"
+diff "$PASTA_DEMO/original.txt" "$PASTA_DEMO/baixado.txt" && echo "ARQUIVOS IDÊNTICOS"
+docker compose run --rm cli ls /drive
 ```
 
 ---
@@ -54,93 +58,97 @@ docker compose run --rm --profile tools cli ls /drive/
 ### [1:30 – 2:00] Status do cluster e replicação (cenário V2)
 
 ```bash
-docker compose run --rm --profile tools cli status
+docker compose run --rm cli status
+docker compose run --rm cli stat "$ARQUIVO_REMOTO"
 ```
 
-**Mostrar:** 5 nós ALIVE, capacidade de cada um, blocos distribuídos em 3 nós distintos.
+**Mostrar:** cinco nós `NODE_ALIVE` e suas capacidades no `status`. Use o `stat` para mostrar o bloco e suas três réplicas em nós distintos. Os contadores de arquivos do `status` têm um defeito conhecido.
 
 ```bash
 # ver métricas brutas de um nó
-curl http://localhost:9101/metrics | grep dcomp_blocks
+curl -fsS http://localhost:9101/metrics | grep '^dcomp_storage_blocks '
 ```
 
 ---
 
 ### [2:00 – 3:30] Falha e recuperação automática (cenário V3)
 
-```bash
-# derrubar um nó
-docker compose stop storage-3
-```
-
-**Aguardar 15 segundos**, depois:
+Escolha um dos nós com réplica saudável no `stat`.
 
 ```bash
-# mostrar detecção
-docker compose run --rm --profile tools cli status
+read -r -p 'Nó com réplica (ex.: storage-3): ' NO_FALHA
+docker compose stop "$NO_FALHA"
 ```
 
-**Mostrar:** storage-3 aparece como SUSPECT ou DEAD. Blocos sub-replicados sendo recuperados.
+Consulte o estado do nó e as réplicas enquanto ele estiver parado. Repita as consultas até o `stat` mostrar a recomposição.
 
 ```bash
-# reiniciar o nó
-docker compose start storage-3
+docker compose run --rm cli status
+docker compose run --rm cli stat "$ARQUIVO_REMOTO"
 ```
 
-**Aguardar 15 segundos**, depois:
+**Mostrar:** o nó parado aparece como `NODE_SUSPECT` ou `NODE_DEAD`. A recuperação fica comprovada quando o arquivo volta a `REPLICATION_HEALTHY` com três réplicas saudáveis e um novo destino.
 
 ```bash
-docker compose run --rm --profile tools cli status
+docker compose start "$NO_FALHA"
+docker compose run --rm cli status
 ```
 
-**Mostrar:** storage-3 voltou para ALIVE, cluster saudável.
+**Mostrar:** o nó voltou para `NODE_ALIVE`. Se ainda estiver registrando, repita o `status`.
 
 ---
 
 ### [3:30 – 4:30] Detecção de corrupção (cenário V4)
 
-```bash
-# simular corrupção em um bloco do storage-1
-docker compose exec storage-1 python -m storage.corrupt_tool --random
-```
-
-**Aguardar o scrubber detectar (~30-60s)**, depois:
+Escolha uma réplica saudável do arquivo da demo no `stat`. Na listagem do storage, copie o UUID completo da primeira coluna que corresponde ao prefixo exibido pelo `stat`. A segunda coluna é o tamanho em bytes.
 
 ```bash
-# ver log de corrupção detectada
-docker compose exec storage-1 grep corruption /logs/storage-1.jsonl | tail -3
+docker compose run --rm cli stat "$ARQUIVO_REMOTO"
+read -r -p 'Nó com réplica do arquivo da demo: ' NO_CORRUPCAO
+docker compose exec "$NO_CORRUPCAO" python -m storage.corrupt_tool --list
+read -r -p 'UUID completo do bloco da demo: ' BLOCO_ID
+docker compose exec "$NO_CORRUPCAO" python -m storage.corrupt_tool --block-id "$BLOCO_ID"
 ```
 
-**Mostrar:** evento de corrupção detectada com `block_id` e ação tomada (re-replicação).
+Após a próxima verificação do scrubber (intervalo padrão de 60 segundos), consulte os eventos do bloco:
+
+```bash
+docker compose logs --since 2m "$NO_CORRUPCAO" central | grep -F "$BLOCO_ID"
+docker compose run --rm cli stat "$ARQUIVO_REMOTO"
+docker compose run --rm cli get "$ARQUIVO_REMOTO" "/work/$NOME_DEMO/apos-corrupcao.txt"
+diff "$PASTA_DEMO/original.txt" "$PASTA_DEMO/apos-corrupcao.txt" && echo "ARQUIVOS IDÊNTICOS"
+```
+
+**Mostrar:** detecção e descarte da cópia corrompida, além do download íntegro. Se restarem menos de três réplicas saudáveis, confira a recomposição no `stat`. Se já restarem três, nenhuma nova cópia precisa ser criada.
 
 ---
 
 ### [4:30 – 5:00] Descoberta de novo nó
 
 ```bash
-# adicionar sexto nó sem reiniciar o cluster
-docker compose --profile extra up -d storage-6
-
-# verificar que o nó foi registrado
-docker compose run --rm --profile tools cli status
+docker compose ps
+docker compose --profile extra up -d --no-deps --wait storage-6
+docker compose run --rm cli status
+docker compose --profile extra ps
 ```
 
-**Mostrar:** storage-6 aparece como ALIVE, cluster agora com 6 nós.
+**Mostrar:** seis nós registrados, com o `storage-6` em `NODE_ALIVE`. Compare o tempo de atividade do central e dos cinco nós originais antes e depois.
 
 ---
 
-## Comandos de limpeza
+## Encerrar a demo
+
+Para parar o cluster e preservar os volumes:
 
 ```bash
 docker compose --profile extra down
-docker compose down -v
 ```
 
 ---
 
+Para zerar um ambiente descartável, use `docker compose --profile extra down -v` no lugar do comando acima. A opção `-v` apaga os volumes de metadados e blocos.
+
 ## Pontos de atenção durante a demo
 
-- Se o `docker compose ps` mostrar algum serviço `unhealthy`, aguardar mais 10–15s e verificar `docker compose logs central`
-- O `cli status` precisa do `--profile tools`: `docker compose run --rm --profile tools cli status`
-- Os logs ficam em `./logs/` na raiz do projeto — boa forma de mostrar observabilidade
-- Para Windows, substitua `/tmp/` por um caminho local: `C:\Temp\`
+- Se algum serviço ficar `unhealthy`, consulte `docker compose logs --tail 50 <serviço>`.
+- Execute os blocos em Bash. No Windows, use Bash via WSL e mantenha os arquivos da demo em `workspace/`.
