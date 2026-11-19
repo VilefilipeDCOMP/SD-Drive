@@ -4,10 +4,11 @@ Sistema de armazenamento distribuído com replicação, detecção de falhas e r
 
 ## Pré-requisitos
 
-| Ferramenta | Versão mínima |
+| Ferramenta | Versão ou requisito |
 |---|---|
-| Docker + Compose plugin | 24+ |
-| Python | 3.11+ (apenas para testes locais) |
+| Docker Engine | 24+ |
+| Docker Compose | v2 |
+| Python | 3.11+ (apenas para testes e scripts locais) |
 
 ---
 
@@ -17,74 +18,66 @@ Sistema de armazenamento distribuído com replicação, detecção de falhas e r
 git clone https://github.com/VilefilipeDCOMP/SD-Drive.git
 cd SD-Drive
 
-# gera stubs gRPC localmente (necessário para testes)
-pip install -r requirements-dev.txt
-python scripts/gerar_proto.py
-
-# sobe 1 central + 5 nós de storage em background
-docker compose up -d --build
-
-# acompanha os logs
-docker compose logs -f
+docker compose up -d --build --wait
+docker compose ps
 ```
 
-Após alguns segundos, `docker compose ps` deve mostrar todos os serviços **healthy**.
+O Dockerfile instala as dependências e gera os stubs gRPC. O `ps` deve mostrar o central e os cinco nós iniciais como **healthy**. Para acompanhar a inicialização, use `docker compose logs -f central`.
 
 ---
 
 ## Comandos da CLI
 
-A CLI roda dentro da rede Docker e enxerga os serviços pelos nomes internos.
+A CLI roda na rede Docker. O Compose monta `workspace/` do host em `/work` no contêiner. Coloque os arquivos de entrada em `workspace/` e salve os downloads em `/work` para acessá-los no host.
 
 ### Arquivos
 
+Crie o diretório remoto com `docker compose run --rm cli mkdir /drive` se ele ainda não existir. Para os exemplos abaixo, coloque `meu_arquivo.txt` e `secreto.bin` em `workspace/`. O exemplo de criptografia usa `openssl` no host para gerar uma chave de demonstração.
+
 ```bash
 # enviar arquivo
-docker compose run --rm --profile tools cli put /work/meu_arquivo.txt /drive/meu_arquivo.txt
+docker compose run --rm cli put /work/meu_arquivo.txt /drive/meu_arquivo.txt
 
 # baixar arquivo
-docker compose run --rm --profile tools cli get /drive/meu_arquivo.txt /work/baixado.txt
+docker compose run --rm cli get /drive/meu_arquivo.txt /work/baixado.txt
 
-# enviar com criptografia AES-256-GCM
-docker compose run --rm --profile tools cli put /work/secreto.bin /drive/secreto.bin --key "minha-chave-32b"
-docker compose run --rm --profile tools cli get /drive/secreto.bin /work/secreto.bin --key "minha-chave-32b"
+# enviar e baixar com criptografia AES-256-GCM
+CHAVE_DEMO=$(openssl rand -hex 32)
+docker compose run --rm cli put /work/secreto.bin /drive/secreto.bin --key "$CHAVE_DEMO"
+docker compose run --rm cli get /drive/secreto.bin /work/secreto-baixado.bin --key "$CHAVE_DEMO"
 ```
 
 ### Namespace
 
 ```bash
-docker compose run --rm --profile tools cli ls /drive/
-docker compose run --rm --profile tools cli stat /drive/meu_arquivo.txt
-docker compose run --rm --profile tools cli mkdir /drive/pasta
-docker compose run --rm --profile tools cli rename /drive/antigo.txt /drive/novo.txt
-docker compose run --rm --profile tools cli delete /drive/meu_arquivo.txt
-docker compose run --rm --profile tools cli rmdir /drive/pasta
+docker compose run --rm cli ls /drive
+docker compose run --rm cli stat /drive/meu_arquivo.txt
+docker compose run --rm cli mkdir /drive/pasta
+docker compose run --rm cli rename /drive/meu_arquivo.txt /drive/novo.txt
+docker compose run --rm cli delete /drive/novo.txt
+docker compose run --rm cli rmdir /drive/pasta
 ```
 
 ### Operacional
 
 ```bash
 # saúde do cluster e capacidade dos nós
-docker compose run --rm --profile tools cli status
+docker compose run --rm cli status
 
 # modo watch (atualiza a cada 2s)
-docker compose run --rm --profile tools cli status --watch
-
-# drenar um nó (migra blocos para outros nós)
-docker compose run --rm --profile tools cli drain storage-3
+docker compose run --rm --entrypoint python cli -m observability.status_cli --target central:50051 --watch 2
 ```
 
-> **Dica:** monte arquivos locais em `/work` usando `-v $(pwd)/meus_arquivos:/work`.
+Para solicitar o esvaziamento de um nó, copie o UUID exibido no `status` e passe-o como argumento de `docker compose run --rm cli drain`. A resposta indica que a solicitação foi aceita. Use `stat` para conferir as réplicas do arquivo, pois os contadores de arquivos do `status` têm um defeito conhecido.
 
 ---
 
 ## Métricas Prometheus
 
-Cada serviço expõe `/metrics` em sua porta:
+O Compose publica `/metrics` dos cinco storages iniciais nas portas abaixo. O processo central atual não serve métricas na porta `9100`.
 
 | Serviço | Porta |
 |---|---|
-| central | `localhost:9100` |
 | storage-1 | `localhost:9101` |
 | storage-2 | `localhost:9102` |
 | storage-3 | `localhost:9103` |
@@ -92,65 +85,56 @@ Cada serviço expõe `/metrics` em sua porta:
 | storage-5 | `localhost:9105` |
 
 ```bash
-curl http://localhost:9100/metrics
+curl -fsS http://localhost:9101/metrics
 ```
 
 ---
 
 ## Variáveis de ambiente
 
-| Variável | Padrão | Descrição |
+| Variável | Valor no Compose | Descrição |
 |---|---|---|
-| `DCOMP_CONFIG` | `config.yaml` | caminho do arquivo de configuração |
+| `DCOMP_CONFIG` | `/app/config.yaml` | caminho de configuração usado pelo central e pela CLI |
 | `DCOMP_CONTROLLER_TARGET` | `central:50051` | endereço do central (storage) |
 | `DCOMP_CLIENT__CENTRAL_TARGET` | `central:50051` | endereço do central (cli) |
 | `DCOMP_STORAGE_ADVERTISE` | — | endereço que o nó anuncia ao central |
-| `DCOMP_MACHINE_ID` | — | id da máquina física |
-| `DCOMP_DISK_ID` | — | id do disco |
+| `DCOMP_MACHINE_ID` | varia por nó | domínio de falha da máquina (simulado no Compose) |
+| `DCOMP_DISK_ID` | varia por nó | domínio de falha do disco (simulado no Compose) |
 | `DCOMP_STORAGE_CAPACITY_BYTES` | `2147483648` | capacidade lógica do nó (2 GiB) |
-| `DCOMP_OBSERVABILITY__METRICS_PORT` | `9100` | porta do endpoint `/metrics` |
-| `DCOMP_OBSERVABILITY__LOG_FILE` | `/logs/central.jsonl` | arquivo de log estruturado |
+| `DCOMP_METRICS_PORT` | `9100` por padrão no storage | porta interna de métricas lida pelo storage |
+| `DCOMP_OBSERVABILITY__LOG_FILE` | varia por serviço | caminho de eventos usado pela CLI; para ver os logs dos processos, use `docker compose logs` |
 
 ---
 
 ## Verificação dos cenários
 
-```bash
-python scripts/verificar_parte1.py
-```
-
-Verifica automaticamente os 4 cenários mínimos:
+Os quatro cenários mínimos para verificar no cluster são:
 - **V1** — put/get com verificação SHA-256
 - **V2** — replicação em 3 nós distintos
 - **V3** — falha de nó e recuperação automática
 - **V4** — detecção de corrupção por scrubbing
 
+O script `scripts/verificar_parte1.py` ainda precisa usar os caminhos montados e identificar o nó que contém a réplica de teste.
+
 ---
 
-## Validar proto
+## Testes e validação do contrato gRPC
+
+Para executar a suíte local no Bash, crie um ambiente virtual e gere os stubs:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python scripts/gerar_proto.py
 python scripts/validar_proto.py
+PYTHONPATH=src:tests python -m pytest -q
 ```
 
-Recompila os stubs e verifica serviços, RPCs e assinaturas de streaming.
-
----
-
-## Testes unitários
+A suíte inclui testes que abrem sockets locais para gRPC e HTTP. Para executar apenas os testes de configuração e logging:
 
 ```bash
-# instalar dependências
-pip install -r requirements-dev.txt
-
-# gerar stubs
-python scripts/gerar_proto.py
-
-# rodar todos os testes
-python -m pytest -q
-
-# somente testes que não precisam de rede
-python -m pytest tests/test_config.py tests/test_logging.py tests/test_metrics.py tests/test_status_cli.py -q
+python -m pytest -q tests/test_config.py tests/test_logging.py
 ```
 
 ---
@@ -158,7 +142,8 @@ python -m pytest tests/test_config.py tests/test_logging.py tests/test_metrics.p
 ## Adicionar sexto nó (descoberta automática)
 
 ```bash
-docker compose --profile extra up -d storage-6
+docker compose --profile extra up -d --no-deps --wait storage-6
+docker compose run --rm cli status
 ```
 
 O central detecta e registra o novo nó automaticamente, sem reiniciar o cluster.
@@ -168,9 +153,10 @@ O central detecta e registra o novo nó automaticamente, sem reiniciar o cluster
 ## Parar e limpar
 
 ```bash
-docker compose down          # para e remove containers
-docker compose down -v       # também remove volumes (apaga dados)
+docker compose --profile extra down
 ```
+
+O comando preserva os volumes. Para zerar um ambiente descartável, use `docker compose --profile extra down -v`, que também apaga os volumes de metadados e blocos.
 
 ---
 
@@ -192,10 +178,9 @@ SD-Drive/
 ├── scripts/
 │   ├── gerar_proto.py      # compila stubs gRPC
 │   ├── validar_proto.py    # valida serviços e assinaturas
-│   └── verificar_parte1.py # valida os 4 cenários mínimos
+│   └── verificar_parte1.py # verificador experimental
 ├── docs/
-│   ├── RELATORIO_PARTE1.md
-│   └── ROTEIRO_DEMO.md
+│   └── RELATORIO_PARTE1.md
 ├── Dockerfile
 ├── docker-compose.yml
 ├── config.example.yaml
