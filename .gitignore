@@ -226,6 +226,7 @@ __marimo__/
 /logs/*
 !/logs/.gitkeep
 /data/
+/docs/
 /workspace/*
 !/workspace/.gitkeep
 *.key

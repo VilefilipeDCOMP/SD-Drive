@@ -179,8 +179,6 @@ SD-Drive/
 │   ├── gerar_proto.py      # compila stubs gRPC
 │   ├── validar_proto.py    # valida serviços e assinaturas
 │   └── verificar_parte1.py # verificador experimental
-├── docs/
-│   └── RELATORIO_PARTE1.md
 ├── Dockerfile
 ├── docker-compose.yml
 ├── config.example.yaml
